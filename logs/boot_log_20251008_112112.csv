@@ -1,0 +1,4 @@
+ts,status,bars_dist,int_dist,cycles
+2025-10-08T11:21:12,Device Connected,33,0,0
+2025-10-08T11:21:21,Device Not Connected,0,33,0
+2025-10-08T11:21:22,other,27,36,0

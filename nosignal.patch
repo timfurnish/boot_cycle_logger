@@ -1,0 +1,158 @@
+*** a/boot_cycle_gui_web-macpc.py
+--- b/boot_cycle_gui_web-macpc.py
+***************
+*** 79,85 ****
+  def label_for(state):
+-     return "Device Not Connected" if state=="BARS" else "Device Connected" if state=="INTERFACE" else "other"
++     return "Device Not Connected" if state=="BARS" else "Device Connected" if state=="INTERFACE" else "No Signal"
+  
+***************
+*** 108,117 ****
+          self.count_bars = 0
+          self.count_int  = 0
+-         self.count_other= 0
++         self.count_no_signal = 0
+          self.cycles     = 0
+          self.await_connect = True
+  
+          # stabilization
+          self._last = "UNKNOWN"
+          self._raw_last = "UNKNOWN"
+          self._raw_stable = 0
+          self._last_change_ts = 0.0
+  
+          # last-seen timestamps
+-         self.last_seen = {"BARS": None, "INTERFACE": None, "OTHER": None}
++         self.last_seen = {"BARS": None, "INTERFACE": None, "NO_SIGNAL": None}
+  
+***************
+*** 139,145 ****
+      if (db < thresh) and (not is_dark_flat):
+          det = "BARS"
+      elif di < thresh:
+          det = "INTERFACE"
+      else:
+-         det = "OTHER"
++         det = "NO_SIGNAL"
+      return det, int(db), int(di), cg, mean_lum, std_lum
+  
+***************
+*** 166,174 ****
+  def run_loop():
+      mon.worker = threading.current_thread()
+      try:
+          bars_h = ph_ref(mon.bars_ref, mon.center_w)
+          int_h  = ph_ref(mon.int_ref,  mon.center_w)
+      except Exception as e:
+          with mon.lock:
+              mon.status = f"error: {e}"
+              mon.running = False
+          return
+***************
+*** 284,295 ****
+                  if det == "BARS":
+                      mon.count_bars += 1
+                      mon.await_connect = True  # any non-connected period arms the cycle
+                  elif det == "INTERFACE":
+                      mon.count_int  += 1
+                      # Count a cycle when we reach INTERFACE after any non-connected period
+                      if mon.await_connect:
+                          mon.cycles += 1
+                          mon.await_connect = False
+-                 else:  # OTHER
+-                     mon.count_other += 1
++                 else:  # NO_SIGNAL
++                     mon.count_no_signal += 1
+                      mon.await_connect = True  # arm cycle when leaving connected state
+  
+                  mon.last_seen[det] = now
+                  mon._last = det
+***************
+*** 316,325 ****
+  app = Flask(__name__)
+  
+  HTML = """
+  <!doctype html>
+  <html>
+  <head>
+    <meta charset="utf-8"/>
+    <title>Boot Cycle Logger</title>
+    <style>
+***************
+*** 412,420 ****
+    <div class="row">
+      <div class="stat"><div class="label">Status</div><div id="status" class="value">idle</div></div>
+      <div class="stat"><div class="label">Not Connected</div><div id="barsCount" class="value">0</div><div class="sub" id="barsSeen">last: -</div></div>
+      <div class="stat"><div class="label">Connected</div><div id="intCount" class="value">0</div><div class="sub" id="intSeen">last: -</div></div>
+-     <div class="stat"><div class="label">Other</div><div id="otherCount" class="value">0</div><div class="sub" id="otherSeen">last: -</div></div>
++     <div class="stat"><div class="label">No Signal</div><div id="noSignalCount" class="value">0</div><div class="sub" id="noSignalSeen">last: -</div></div>
+      <div class="stat"><div class="label">Cycles</div><div id="cyclesCount" class="value">0</div></div>
+    </div>
+  
+***************
+*** 436,442 ****
+        const t = (text || '').toLowerCase();
+        if (t.includes('connected') && !t.includes('not')) bg = 'var(--pillConnected)';
+        else if (t.includes('not connected')) bg = 'var(--pillNotConnected)';
+-       else if (t.includes('other')) bg = 'var(--pillOther)';
++       else if (t.includes('no signal')) bg = 'var(--pillOther)';
+        pill.style.background = bg;
+      }
+      function bust(url){ return url + (url.includes('?')?'&':'?') + 't=' + Date.now(); }
+***************
+*** 498,505 ****
+        document.getElementById('status').textContent = display;
+        document.getElementById('barsCount').textContent   = j.count_bars;
+        document.getElementById('intCount').textContent    = j.count_int;
+-       document.getElementById('otherCount').textContent  = j.count_other;
++       document.getElementById('noSignalCount').textContent  = j.count_no_signal;
+        document.getElementById('cyclesCount').textContent = j.cycles;
+        document.getElementById('barsSeen').textContent  = 'last: ' + (j.last_seen.BARS || '-');
+        document.getElementById('intSeen').textContent   = 'last: ' + (j.last_seen.INTERFACE || '-');
+-       document.getElementById('otherSeen').textContent = 'last: ' + (j.last_seen.OTHER || '-');
++       document.getElementById('noSignalSeen').textContent = 'last: ' + (j.last_seen.NO_SIGNAL || '-');
+        paintPill(display);
+        if (!backendInit) {
+          document.getElementById('backend').value = (j.backend || 'auto');
+***************
+*** 571,589 ****
+  def status():
+      with mon.lock:
+-         sf = label_for(mon.status) if mon.status in ("BARS","INTERFACE","OTHER") else mon.status
++         sf = label_for(mon.status) if mon.status in ("BARS","INTERFACE","NO_SIGNAL") else mon.status
+          return jsonify(
+              status=mon.status, status_friendly=sf, running=mon.running,
+              count_bars=mon.count_bars, count_int=mon.count_int,
+-             count_other=mon.count_other, cycles=mon.cycles,
++             count_no_signal=mon.count_no_signal, cycles=mon.cycles,
+              last_seen=mon.last_seen, backend=mon.backend_name,
+              fourcc=mon.fourcc, res_preset=mon.res_preset
+          )
+  
+***************
+*** 624,632 ****
+      if have_recent:
+          for k in ("db","di","mean","std"):
+              if m.get(k) is None:
+                  m[k] = "-"
+          return jsonify(m)
+      try:
+          bars_h = ph_ref(bars_path, cw)
+          int_h  = ph_ref(int_path,  cw)
+---  (no functional change; context only)
+***************
+*** 770,781 ****
+  def clear():
+      with mon.lock:
+          if mon.running:
+              return jsonify(error="stop first"), 400
+          mon.reset_counts_and_roll_csv()
+      return jsonify(ok=True, csv=mon.csv_path)
+  
+  # New endpoint: reset tallies (counters and last-seen) without rolling CSV, allowed even while running
+  @app.post("/reset_tallies")
+  def reset_tallies():
+      with mon.lock:
+          mon.reset_tallies()
+      return jsonify(ok=True)
+*** End Patch

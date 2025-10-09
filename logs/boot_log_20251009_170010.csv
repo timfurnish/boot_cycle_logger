@@ -1,0 +1,16 @@
+ts,status,bars_dist,int_dist,cycles
+2025-10-09T17:00:11,Device Not Connected,2,34,0
+2025-10-09T17:00:30,Device Connected,32,0,1
+2025-10-09T17:00:34,other,32,32,1
+2025-10-09T17:00:36,Device Connected,32,0,2
+2025-10-09T17:00:44,other,32,32,2
+2025-10-09T17:00:44,Device Not Connected,2,34,2
+2025-10-09T17:00:48,other,24,12,2
+2025-10-09T17:00:49,Device Connected,32,0,3
+2025-10-09T17:00:55,other,32,32,3
+2025-10-09T17:01:03,Device Not Connected,2,34,3
+2025-10-09T17:01:07,Device Connected,32,0,4
+2025-10-09T17:02:09,Device Not Connected,2,34,4
+2025-10-09T17:02:12,other,24,12,4
+2025-10-09T17:02:13,Device Connected,32,0,5
+2025-10-09T17:02:15,other,32,36,5
