@@ -10,9 +10,18 @@ Then open http://localhost:5055/
 Build (Windows ARM64/x64):
   pyinstaller --noconfirm --onefile --noconsole ^
     --name BootCycleLogger ^
-    --add-data "Comp-Scope-Disconnected-ColorBars.png;." ^
-    --add-data "Comp-Still-&-Video-capture-disabled.png;." ^
-    boot_cycle_gui_web.py
+    --add-data "Scope-Disconnected.png;." ^
+    --add-data "Scope-Connected-SidewinderCCU.png;." ^
+    --add-data "Scope-Connected-OtherCCU.png;." ^
+    boot_cycle_gui_web-macpc.py
+
+Build (macOS/Linux):
+  pyinstaller --noconfirm --onefile --noconsole \
+    --name BootCycleLogger \
+    --add-data "Scope-Disconnected.png:." \
+    --add-data "Scope-Connected-SidewinderCCU.png:." \
+    --add-data "Scope-Connected-OtherCCU.png:." \
+    boot_cycle_gui_web-macpc.py
 """
 
 import os, sys, threading, time, csv, platform, webbrowser, subprocess
@@ -47,15 +56,14 @@ STABLE   = 3
 DARK_MEAN= 22.0
 DARK_STD = 12.0
 
-# Reference images live alongside the script/binary (robust for PyInstaller)
-BARS_REF = os.path.join(APP_DIR, "Comp-Scope-Disconnected-ColorBars.png")
-INT_REF  = os.path.join(APP_DIR, "Comp-Still-&-Video-capture-disabled.png")
+# Reference images (always relative to the app directory so the project is portable)
+# Place these PNGs next to the script or in the PyInstaller bundle.
+BARS_REF = os.path.join(APP_DIR, "Scope-Disconnected.png")
+INT_REF  = os.path.join(APP_DIR, "Scope-Connected-SidewinderCCU.png")
+INT_REF2 = os.path.join(APP_DIR, "Scope-Connected-OtherCCU.png")
 
-# Logs: on Windows write to Public; elsewhere use ./logs
-if platform.system() == "Windows":
-    LOG_ROOT = r"C:\Users\Public\boot_cycle_logger\logs"
-else:
-    LOG_ROOT = "logs"
+# Logs: relative to the app directory so the project is portable across machines
+LOG_ROOT = os.path.join(APP_DIR, "logs")
 os.makedirs(LOG_ROOT, exist_ok=True)
 CSV_PATH = os.path.join(LOG_ROOT, f"boot_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
 
@@ -75,6 +83,17 @@ THUMB_EVERY_MS = 1500
 # Live thumbnail target size (keep 16:9 to match source aspect)
 THUMB_W = 256
 THUMB_H = 144
+
+def _placeholder_thumb():
+    """Generate a neutral 16:9 placeholder thumbnail when no frame is available."""
+    img = np.zeros((THUMB_H, THUMB_W, 3), dtype=np.uint8)
+    # subtle border
+    cv2.rectangle(img, (0, 0), (THUMB_W - 1, THUMB_H - 1), (60, 60, 60), 1)
+    try:
+        cv2.putText(img, "no frame", (10, THUMB_H // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1, cv2.LINE_AA)
+    except Exception:
+        pass
+    return img
 
 def crop(bgr, cw=CENTER_W):
     h, w, _ = bgr.shape
@@ -107,7 +126,15 @@ def ph_ref(path, cw):
     return ph(crop(img, cw))
 
 def label_for(state):
-    return "Device Not Connected" if state=="BARS" else "Device Connected" if state=="INTERFACE" else "other"
+    """Map internal states to user-facing labels (used in UI and CSV)."""
+    if state == "BARS":
+        return "Device Not Connected"
+    elif state == "INTERFACE":
+        return "Device Connected"
+    elif state == "NO_SIGNAL":
+        return "No Signal"
+    else:
+        return "Other"
 
 class Monitor:
     def __init__(self):
@@ -132,6 +159,7 @@ class Monitor:
         self._last_thumb_ts = 0.0
         self.bars_ref  = BARS_REF
         self.int_ref   = INT_REF
+        self.int_ref2  = INT_REF2
         self.csv_path  = CSV_PATH
 
         # runtime state
@@ -153,7 +181,7 @@ class Monitor:
         self._last_change_ts = 0.0
 
         # last-seen timestamps
-        self.last_seen = {"BARS": None, "INTERFACE": None, "OTHER": None}
+        self.last_seen = {"BARS": None, "INTERFACE": None, "OTHER": None, "NO_SIGNAL": None}
 
         # live frames/metrics for thumbnail + tester
         self.last_frame = None
@@ -183,7 +211,7 @@ class Monitor:
         self._last = "UNKNOWN"
         self._raw_last = "UNKNOWN"
         self._raw_stable = 0
-        self.last_seen = {"BARS": None, "INTERFACE": None, "OTHER": None}
+        self.last_seen = {"BARS": None, "INTERFACE": None, "OTHER": None, "NO_SIGNAL": None}
         # new timestamped CSV on each clear
         self.csv_path = os.path.join(LOG_ROOT, f"boot_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
         self.await_connect = True
@@ -197,7 +225,7 @@ class Monitor:
         self._last = "UNKNOWN"
         self._raw_last = "UNKNOWN"
         self._raw_stable = 0
-        self.last_seen = {"BARS": None, "INTERFACE": None, "OTHER": None}
+        self.last_seen = {"BARS": None, "INTERFACE": None, "OTHER": None, "NO_SIGNAL": None}
         self.await_connect = True
 
 mon = Monitor()
@@ -210,13 +238,17 @@ def open_csv(path):
         w.writerow(["ts","status","bars_dist","int_dist","cycles"])
     return f, w
 
-def decide(frame, bars_h, int_h, center_w, thresh, dmean, dstd):
+def decide(frame, bars_h, int_h, center_w, thresh, dmean, dstd, int2_h=None):
     cg = crop(frame, center_w)
     phv = ph(cg)
-    db, di = phv - bars_h, phv - int_h
+    db, di1 = phv - bars_h, phv - int_h
+    di2 = (phv - int2_h) if int2_h is not None else None
+    di = min(di1, di2) if di2 is not None else di1
     mean_lum = float(np.mean(cg)); std_lum = float(np.std(cg))
     is_dark_flat = (mean_lum < dmean) and (std_lum < dstd)
-    if (db < thresh) and (not is_dark_flat):
+    if is_dark_flat:
+        det = "NO_SIGNAL"
+    elif (db < thresh):
         det = "BARS"
     elif di < thresh:
         det = "INTERFACE"
@@ -229,6 +261,11 @@ def run_loop():
     try:
         bars_h = ph_ref(mon.bars_ref, mon.center_w)
         int_h  = ph_ref(mon.int_ref,  mon.center_w)
+        int2_h = None
+        try:
+            int2_h = ph_ref(mon.int_ref2, mon.center_w)
+        except Exception:
+            int2_h = None
     except Exception as e:
         with mon.lock:
             mon.status = f"error: {e}"
@@ -345,7 +382,7 @@ def run_loop():
                 time.sleep(0.05)
                 continue
 
-            det, db, di, crop_img, mean_l, std_l = decide(frame, bars_h, int_h, cw, thr, dmean, dstd)
+            det, db, di, crop_img, mean_l, std_l = decide(frame, bars_h, int_h, cw, thr, dmean, dstd, int2_h=int2_h)
 
             with mon.lock:
                 # update live artifacts
@@ -507,8 +544,9 @@ HTML = """
       <div><label>Stable Frames</label><input id="st" type="number" value="{{st}}"></div>
       <div><label>Dark Mean</label><input id="dm" type="number" value="{{dm}}"></div>
       <div><label>Dark Std</label><input id="ds" type="number" value="{{ds}}"></div>
-      <div><label>Bars Ref</label><input id="bars" value="{{bars}}"></div>
-      <div><label>Interface Ref</label><input id="intr" value="{{intr}}"></div>
+      <div><label>Device Disconnected Ref</label><input id="bars" value="{{bars}}"></div>
+      <div><label>Scope Connected Ref</label><input id="intr" value="{{intr}}"></div>
+      <div><label>Scope Connected (Alt) Ref</label><input id="intr2" value="{{intr2}}"></div>
       <div><label>CSV Path</label><input id="csv" value="{{csv}}"></div>
     </div>
     <div style="margin-top:12px; display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
@@ -557,7 +595,7 @@ HTML = """
     <div class="stat"><div class="label">Status</div><div id="status" class="value">idle</div></div>
     <div class="stat"><div class="label">Not Connected</div><div id="barsCount" class="value">0</div><div class="sub" id="barsSeen">last: -</div></div>
     <div class="stat"><div class="label">Connected</div><div id="intCount" class="value">0</div><div class="sub" id="intSeen">last: -</div></div>
-    <div class="stat"><div class="label">Other</div><div id="otherCount" class="value">0</div><div class="sub" id="otherSeen">last: -</div></div>
+    <div class="stat"><div class="label">No Signal</div><div id="otherCount" class="value">0</div><div class="sub" id="otherSeen">last: -</div></div>
     <div class="stat"><div class="label">Cycles</div><div id="cyclesCount" class="value">0</div></div>
   </div>
 
@@ -573,7 +611,7 @@ HTML = """
       const t = (text || '').toLowerCase();
       if (t.includes('connected') && !t.includes('not')) bg = 'var(--pillConnected)';
       else if (t.includes('not connected')) bg = 'var(--pillNotConnected)';
-      else if (t.includes('other')) bg = 'var(--pillOther)';
+      else if (t.includes('no signal')) bg = 'var(--pillOther)';
       pill.style.background = bg;
     }
     function bust(url){ return url + (url.includes('?')?'&':'?') + 't=' + Date.now(); }
@@ -678,6 +716,7 @@ HTML = """
         ds:   parseFloat(document.getElementById('ds').value),
         bars: document.getElementById('bars').value,
         intr: document.getElementById('intr').value,
+        intr2: document.getElementById('intr2').value,
         csv:  document.getElementById('csv').value,
       };
       await fetch('/start', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
@@ -724,7 +763,7 @@ HTML = """
 def index():
     return render_template_string(HTML,
         src=mon.src, cw=mon.center_w, thr=mon.thresh, st=mon.stable_frames,
-        dm=mon.dark_mean, ds=mon.dark_std, bars=mon.bars_ref, intr=mon.int_ref,
+        dm=mon.dark_mean, ds=mon.dark_std, bars=mon.bars_ref, intr=mon.int_ref, intr2=mon.int_ref2,
         csv=mon.csv_path, stream=mon.stream_path, backend=mon.backend_name,
         fourcc=mon.fourcc, res=mon.res_preset
     )
@@ -736,7 +775,7 @@ def ping():
 @app.get("/status")
 def status():
     with mon.lock:
-        sf = label_for(mon.status) if mon.status in ("BARS","INTERFACE","OTHER") else mon.status
+        sf = label_for(mon.status) if mon.status in ("BARS","INTERFACE","OTHER","NO_SIGNAL") else mon.status
         return jsonify(
             status=mon.status, status_friendly=sf, running=mon.running,
             count_bars=mon.count_bars, count_int=mon.count_int,
@@ -756,7 +795,8 @@ def thumb():
             except Exception:
                 img = None
         if img is None:
-            return Response(status=404)
+            # Serve a neutral placeholder instead of 404 to keep the UI clean
+            img = _placeholder_thumb()
         ok, buf = cv2.imencode(".jpg", img)
     if not ok:
         return Response(status=500)
@@ -785,6 +825,11 @@ def peek():
     try:
         bars_h = ph_ref(bars_path, cw)
         int_h  = ph_ref(int_path,  cw)
+        int2_h = None
+        try:
+            int2_h = ph_ref(mon.int_ref2, cw)
+        except Exception:
+            int2_h = None
     except Exception as e:
         return jsonify(error=f"ref load: {e}")
     use_stream = isinstance(stream, str) and stream.strip() != ""
@@ -819,7 +864,7 @@ def peek():
         ok, frame = cap.read()
         if not ok:
             return jsonify(error="cannot read frame")
-        det, db, di, crop_img, mean_l, std_l = decide(frame, bars_h, int_h, cw, thr, dmean, dstd)
+        det, db, di, crop_img, mean_l, std_l = decide(frame, bars_h, int_h, cw, thr, dmean, dstd, int2_h=int2_h)
         return jsonify(db=int(db), di=int(di), mean=round(float(mean_l),2), std=round(float(std_l),2), det=det)
     finally:
         try:
@@ -985,6 +1030,7 @@ def start():
         mon.dark_std  = float(cfg.get("ds", mon.dark_std))
         mon.bars_ref  = cfg.get("bars", mon.bars_ref)
         mon.int_ref   = cfg.get("intr", mon.int_ref)
+        mon.int_ref2  = cfg.get("intr2", mon.int_ref2)
         mon.csv_path  = cfg.get("csv", mon.csv_path)
         mon.reset_counts_and_roll_csv()  # also rolls CSV
         mon.running = True
