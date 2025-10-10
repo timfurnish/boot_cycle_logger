@@ -1,20 +1,31 @@
+cat > .gitignore << 'EOF'
 # Python
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
 *.egg-info/
-.build/
-dist/
-build/
 *.spec
 
-# Logs & local artifacts
+# Virtual envs
+.venv/
+.venv-*/
+.venv-mac/
+.venv-win/
+
+# Build artifacts
+build/
+dist/
+
+# Logs & CSVs
 logs/
 *.csv
 
-# OS & editor
+# OS/editor
 .DS_Store
 Thumbs.db
 .vscode/
 .idea/
+EOF
+
+git add .gitignore.DS_Store
