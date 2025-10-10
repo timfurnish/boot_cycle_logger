@@ -28,4 +28,4 @@ Thumbs.db
 .idea/
 EOF
 
-git add .gitignore.DS_Store
+
