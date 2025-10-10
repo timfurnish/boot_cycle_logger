@@ -1,9 +1,0 @@
-ts,status,bars_dist,int_dist,cycles
-2025-10-09T17:05:29,Device Connected,32,0,1
-2025-10-09T17:05:37,other,32,32,1
-2025-10-09T17:05:39,Device Connected,32,0,2
-2025-10-09T17:05:42,other,32,32,2
-2025-10-09T17:05:47,Device Connected,32,0,3
-2025-10-09T17:05:50,Device Not Connected,2,34,3
-2025-10-09T17:05:53,Device Connected,32,0,4
-2025-10-09T17:06:00,other,32,32,4
