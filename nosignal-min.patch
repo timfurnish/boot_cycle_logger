@@ -1,0 +1,18 @@
+*** Begin Patch
+*** Update File: boot_cycle_gui_web-macpc.py
+@@
+-def label_for(state):
+-    return "Device Not Connected" if state=="BARS" else "Device Connected" if state=="INTERFACE" else "other"
++def label_for(state):
++    """
++    Map internal detector states to user-facing labels.
++    Keep INTERNAL enum values (BARS, INTERFACE, OTHER) unchanged so logic/CSV parsing stays stable,
++    but present 'OTHER' as 'No Signal' in the UI and CSV.
++    """
++    if state == "BARS":
++        return "Device Not Connected"
++    if state == "INTERFACE":
++        return "Device Connected"
++    # Present 'OTHER' to the user as 'No Signal'
++    return "No Signal"
+*** End Patch
