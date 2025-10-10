@@ -1,31 +1,24 @@
-cat > .gitignore << 'EOF'
+cat > .gitignore <<'EOF'
 # Python
 __pycache__/
 *.pyc
-*.pyo
-*.pyd
-*.egg-info/
-*.spec
-
-# Virtual envs
 .venv/
 .venv-*/
-.venv-mac/
-.venv-win/
+.env
+
+# macOS
+.DS_Store
 
 # Build artifacts
-build/
 dist/
+build/
+*.spec
 
 # Logs & CSVs
 logs/
-*.csv
+*.log
 
-# OS/editor
-.DS_Store
-Thumbs.db
+# IDE/editors
 .vscode/
 .idea/
 EOF
-
-
