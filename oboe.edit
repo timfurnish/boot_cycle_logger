@@ -1,0 +1,34 @@
+*** Begin Patch
+*** Update File: boot_cycle_gui_web-macpc-6ch.py
+
+@@ def _annotated_grid_from_frame(bgr):
+-        # draw status badge inside tile
+-        _ = draw_status_badge(out, x + 10, y + 10, text, color)
++        # draw status badge inside tile
++        _ = draw_status_badge(out, x + 10, y + 10, text, color)
++
++        # --- Debug overlay: show parameters and measured ROI values ---
++        try:
++            # compute text lines
++            ov_frac = getattr(mon, "white_frac_gate", None)
++            ov_mean = getattr(mon, "mean_gate", None)
++            debug_lines = [
++                f"ov_frac={ov_frac}",
++                f"ov_mean={ov_mean}",
++                f"roi_mean={roi_mean:.1f}",
++                f"w_frac_g={white_frac_gray:.3f}",
++                f"w_frac_rgb={white_frac_rgb:.3f}",
++                f"bright_ok={bright_ok}"
++            ]
++            # draw debug text (stacked) in top-left of tile
++            tx = x + 10
++            ty = y + 40
++            font = cv2.FONT_HERSHEY_SIMPLEX
++            scale = 0.5
++            thickness = 1
++            for i, line in enumerate(debug_lines):
++                y0 = ty + i * 12
++                cv2.putText(out, line, (tx, y0), font, scale, (200, 200, 200), thickness, cv2.LINE_AA)
++        except Exception:
++            pass
+*** End Patch

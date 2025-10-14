@@ -1,0 +1,216 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>Boot Cycle Logger</title>
+  <style>
+    :root {
+      --bg:#0f172a; --text:#e5e7eb; --card:#111827; --border:#1f2937;
+      --btn:#38bdf8; --btnText:#0b1220; --btn2:#1f2937; --muted:#94a3b8;
+      --btn2Hover:#374151;
+      --pillIdle:#334155;
+      --pillConnected:#16a34a;
+      --pillNotConnected:#dc2626;
+      --pillOther:#eab308;
+      --btnDisabled:#334155; --btnDisabledText:#a3a3a3;
+    }
+    * { box-sizing:border-box }
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin:24px; background:var(--bg); color:var(--text); }
+    h1 { color:var(--btn); margin-top:0 }
+    .card { background:var(--card); border:1px solid var(--border); border-radius:12px; padding:16px; margin:12px 0; }
+    .row { display:flex; gap:16px; flex-wrap:wrap; }
+    .stat { flex:1 1 220px; background:#0b1220; border:1px solid var(--border); border-radius:10px; padding:12px; }
+    .label { color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.08em; }
+    .value { font-size:28px; font-weight:700; }
+    .sub { color:var(--muted); font-size:12px; margin-top:6px; }
+    button {
+      background:var(--btn); color:var(--btnText); font-weight:700; border:none; padding:10px 14px;
+      border-radius:8px; cursor:pointer; transition:all .15s ease; outline: none;
+    }
+    button:hover { filter:brightness(1.06); transform:translateY(-1px); }
+    button:active { transform:translateY(0px) scale(0.99); }
+    button.secondary { background:var(--btn2); color:var(--text); }
+    button.secondary:hover { background:var(--btn2Hover); }
+    button:disabled { background:var(--btnDisabled); color:var(--btnDisabledText); cursor:not-allowed; transform:none; }
+    input, select { background:#0b1220; color:var(--text); border:1px solid var(--border); border-radius:6px; padding:8px; width:100%; }
+    .grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap:12px; }
+    .pill {
+      display:inline-flex; align-items:center; justify-content:center;
+      min-width: 320px; padding:18px 26px; border-radius:999px; font-weight:800; font-size:22px;
+      margin: 6px 0 14px 0; border:1px solid #00000022;
+      box-shadow: 0 6px 20px rgba(0,0,0,.25), inset 0 1px 0 rgba(255,255,255,.08);
+    }
+    .thumbBox { display:flex; gap:16px; align-items:center; }
+    .metrics { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size:14px; color:#cbd5e1; }
+  </style>
+</head>
+<body>
+  <h1>Boot Cycle Logger</h1>
+
+  <div class="pill" id="statusPill" style="background: var(--pillIdle);">idle</div>
+
+  <div class="card">
+    <div class="grid">
+      <div><label>Source (index/URL)</label><input id="src" value="{{src}}"></div>
+      <div><label>Backend</label>
+        <select id="backend">
+        <option value="auto" {{ 'selected' if backend|lower=='auto' else '' }}>auto</option>
+        <option value="MSMF" {{ 'selected' if backend|lower=='msmf' else '' }}>MSMF (Windows)</option>
+        <option value="DSHOW" {{ 'selected' if backend|lower=='dshow' else '' }}>DSHOW (Windows)</option>
+        <option value="AVFOUNDATION" {{ 'selected' if backend|lower=='avfoundation' else '' }}>AVFOUNDATION (macOS)</option>
+        <option value="V4L2" {{ 'selected' if backend|lower=='v4l2' else '' }}>V4L2 (Linux)</option>
+        </select>
+      </div>
+      <div><label>FOURCC</label>
+        <select id="fourcc">
+          <option value="auto" {{ 'selected' if fourcc|lower=='auto' else '' }}>auto</option>
+          <option value="MJPG" {{ 'selected' if fourcc|upper=='MJPG' else '' }}>MJPG</option>
+          <option value="YUY2" {{ 'selected' if fourcc|upper=='YUY2' else '' }}>YUY2</option>
+        </select>
+      </div>
+      <div><label>Resolution</label>
+        <select id="res">
+            <option value="1080p" {{ 'selected' if res|lower=='1080p' else '' }}>1080p</option>
+            <option value="720p"  {{ 'selected' if res|lower=='720p'  else '' }}>720p</option>
+        </select>
+      </div>
+      <div><label>Stream URL (rtsp/http)</label><input id="stream" placeholder="rtsp://user:pass@host:554/stream" value="{{stream}}"></div>
+      <div><label>Center Width <span style="color:var(--muted);font-size:12px">(set ≥ video width to disable crop)</span></label><input id="cw" type="number" value="{{cw}}"></div>
+      <div><label>Bars Threshold</label><input id="thr_bars" type="number" min="0" max="128" step="1" value="{{thr}}"></div>
+      <div><label>Connected (ROI) Threshold</label><input id="thr_int" type="number" min="0" max="128" step="1" value="{{thr}}"></div>
+      <div><label>Stable Frames</label><input id="st" type="number" value="{{st}}"></div>
+      <div><label>Dark Mean</label><input id="dm" type="number" value="{{dm}}"></div>
+      <div><label>Dark Std</label><input id="ds" type="number" value="{{ds}}"></div>
+      <div><label>Device Disconnected Ref</label><input id="bars" value="{{bars}}"></div>
+      <div><label>Scope Connected Ref</label><input id="intr" value="{{intr}}"></div>
+      <div><label>Scope Connected (Alt) Ref</label><input id="intr2" value="{{intr2}}"></div>
+      <div><label>CSV Path</label><input id="csv" value="{{csv}}"></div>
+    </div>
+    <div style="margin-top:12px; display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+      <button id="btnStart" onclick="start()">Start</button>
+      <button id="btnStop"  class="secondary" onclick="stop()">Stop</button>
+      <button id="btnClear" class="secondary" onclick="clearCounts()">Clear &amp; New CSV</button>
+      <button id="btnResetTallies" class="secondary" onclick="resetTallies()">Reset tallies</button>
+      <button id="btnProbe" class="secondary" onclick="probe()">Probe source</button>
+      <label style="display:flex; align-items:center; gap:6px; font-size:13px; color:var(--muted);">
+        <input id="liveCropToggle" type="checkbox" checked onchange="toggleThumb()"/>
+        Live crop
+      </label>
+      <div style="flex:1"></div>
+      <span id="csvInfo" style="font-size:12px; color:var(--muted); margin-right:6px;">
+        CSV: <code id="csvPath">-</code>
+      </span>
+      <button class="secondary" onclick="window.location.href='/download'">Download CSV</button>
+      <button class="secondary" onclick="shutdown()">Quit</button>
+    </div>
+
+    <div class="card" style="margin-top:10px; background:#0b1220; color:#9ca3af; font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size:13px;">
+      <div style="display:flex; justify-content:space-between; align-items:center;">
+        <span style="font-weight:700; color:#38bdf8;">Probe Results</span>
+        <button class="secondary" onclick="document.getElementById('probeOut').textContent=''">Clear</button>
+      </div>
+      <pre id="probeOut" style="white-space:pre-wrap; margin-top:8px;"></pre>
+    </div>
+  </div>
+
+  <div class="card thumbBox">
+    <div>
+      <img id="thumb" src="" alt="live crop" width="256" height="144" style="border-radius:8px; border:1px solid var(--border)"/>
+    </div>
+    <div class="metrics">
+      <div><b>Test Frame</b></div>
+      <div id="m_db">bars distance: -</div>
+      <div id="m_di">connected distance: -</div>
+      <div id="m_mean">mean luminance: -</div>
+      <div id="m_std">std luminance: -</div>
+      <div style="margin-top:8px;">
+        <button class="secondary" onclick="peek()">Test frame now</button>
+      </div>
+      <div style="margin-top:8px; color:#9ca3af; font-size:12px;">Tip: if bars/connected distances are close to their thresholds, adjust Bars/Connected Thresholds or Center Width. Dark/flat frames should fail bars by the dark gates.</div>
+    </div>
+  </div>
+
+  <div class="row">
+    <div class="stat"><div class="label">Status</div><div id="status" class="value">idle</div></div>
+    <div class="stat"><div class="label">Not Connected</div><div id="barsCount" class="value">0</div><div class="sub" id="barsSeen">last: -</div></div>
+    <div class="stat"><div class="label">Connected</div><div id="intCount" class="value">0</div><div class="sub" id="intSeen">last: -</div></div>
+    <div class="stat"><div class="label">No Signal</div><div id="otherCount" class="value">0</div><div class="sub" id="otherSeen">last: -</div></div>
+    <div class="stat"><div class="label">Cycles</div><div id="cyclesCount" class="value">0</div></div>
+  </div>
+
+  <script>
+    function bust(u){ return u + (u.includes('?') ? '&' : '?') + 't=' + Date.now(); }
+  
+    async function start(){
+      const body = {
+        src: document.getElementById('src').value,
+        backend: document.getElementById('backend').value,
+        fourcc: document.getElementById('fourcc').value,
+        res: document.getElementById('res').value,
+        thr: parseInt(document.getElementById('thr').value || 10, 10),
+        st: parseInt(document.getElementById('st').value || 3, 10)
+      };
+      await fetch('/start', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(body)
+      });
+    }
+  
+    async function stop(){
+      await fetch('/stop', {method: 'POST'});
+    }
+  
+    async function probe(){
+      const body = {
+        src: document.getElementById('src').value,
+        backend: document.getElementById('backend').value,
+        fourcc: document.getElementById('fourcc').value,
+        res: document.getElementById('res').value
+      };
+      const r = await fetch('/probe', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(body)
+      });
+      document.getElementById('probeOut').textContent = JSON.stringify(await r.json(), null, 2);
+    }
+  
+    function setPill(el, det, idx){
+      const map = {
+        INTERFACE: ['ok', 'Scope Connected'],
+        BARS: ['bad', 'Scope Not Connected'],
+        NO_SIGNAL: ['nosig', 'No Signal'],
+        OTHER: ['other', 'Other']
+      };
+      const [cls, label] = map[det] || ['other', 'Other'];
+      el.className = 'pill ' + cls;
+      el.querySelector('span').textContent = 'VIDEO ' + idx + ' — ' + label;
+    }
+  
+    async function refreshPills(){
+      try {
+        const r = await fetch('/grid_status');
+        const j = await r.json();
+        const arr = j.tiles || [];
+        for (let i = 0; i < 6; i++) {
+          const el = document.getElementById('p' + (i + 1));
+          if (!el) continue;
+          const det = (arr[i] && arr[i].det) || 'OTHER';
+          setPill(el, det, i + 1);
+        }
+      } catch (e) {
+        console.error(e);
+      }
+    }
+  
+    setInterval(() => {
+      const im = document.getElementById('grid');
+      if (im) im.src = bust('/thumb');
+    }, 500);
+  
+    setInterval(refreshPills, 800);
+    refreshPills();
+  </script>
+</body>
+</html>

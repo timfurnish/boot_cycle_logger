@@ -1,0 +1,71 @@
+diff --git a/boot_cycle_gui_web-macpc.py b/boot_cycle_gui_web-macpc.py
+index 0000000..0000001 100644
+--- a/boot_cycle_gui_web-macpc.py
++++ b/boot_cycle_gui_web-macpc.py
+@@ -1,6 +1,6 @@
+@@
+-def label_for(state):
+-    return "Device Not Connected" if state=="BARS" else "Device Connected" if state=="INTERFACE" else "other"
++def label_for(state):
++    return "Device Not Connected" if state=="BARS" else "Device Connected" if state=="INTERFACE" else "No Signal"
+@@
+ def decide(frame, bars_h, int_h, center_w, thresh, dmean, dstd):
+@@
+-    else:
+-        det = "OTHER"
++    else:
++        det = "NO_SIGNAL"
+     return det, int(db), int(di), cg, mean_lum, std_lum
+@@ class Monitor:
+-        self.count_other= 0
++        self.count_no_signal = 0
+@@ class Monitor:
+-        self.last_seen = {"BARS": None, "INTERFACE": None, "OTHER": None}
++        self.last_seen = {"BARS": None, "INTERFACE": None, "NO_SIGNAL": None}
+@@ def reset_counts_and_roll_csv(self):
+-        self.count_bars = self.count_int = self.count_other = self.cycles = 0
++        self.count_bars = self.count_int = self.count_no_signal = self.cycles = 0
+@@ def reset_counts_and_roll_csv(self):
+-        self.last_seen = {"BARS": None, "INTERFACE": None, "OTHER": None}
++        self.last_seen = {"BARS": None, "INTERFACE": None, "NO_SIGNAL": None}
+@@ def run_loop():
+-                    elif det == "INTERFACE":
++                    elif det == "INTERFACE":
+                         mon.count_int  += 1
+-                    else:
+-                        mon.count_other+= 1
++                    else:
++                        mon.count_no_signal += 1
+@@
+-                    w.writerow([now, label_for(det), db, di, mon.cycles])
++                    w.writerow([now, label_for(det), db, di, mon.cycles])
+@@ def status():
+-        sf = label_for(mon.status) if mon.status in ("BARS","INTERFACE","OTHER") else mon.status
++        sf = label_for(mon.status) if mon.status in ("BARS","INTERFACE","NO_SIGNAL") else mon.status
+         return jsonify(
+             status=mon.status, status_friendly=sf, running=mon.running,
+-            count_bars=mon.count_bars, count_int=mon.count_int,
+-            count_other=mon.count_other, cycles=mon.cycles,
++            count_bars=mon.count_bars, count_int=mon.count_int,
++            count_no_signal=mon.count_no_signal, cycles=mon.cycles,
+             last_seen=mon.last_seen, backend=mon.backend_name,
+             fourcc=mon.fourcc, res_preset=mon.res_preset
+         )
+@@
+-HTML = """
++HTML = """
+@@
+-    <div class="stat"><div class="label">Other</div><div id="otherCount" class="value">0</div><div class="sub" id="otherSeen">last: -</div></div>
++    <div class="stat"><div class="label">No Signal</div><div id="noSignalCount" class="value">0</div><div class="sub" id="noSignalSeen">last: -</div></div>
+@@
+-      else if (t.includes('other')) bg = 'var(--pillOther)';
++      else if (t.includes('no signal')) bg = 'var(--pillOther)';
+@@
+-      document.getElementById('otherCount').textContent  = j.count_other;
++      document.getElementById('noSignalCount').textContent  = j.count_no_signal;
+@@
+-      document.getElementById('otherSeen').textContent = 'last: ' + (j.last_seen.OTHER || '-');
++      document.getElementById('noSignalSeen').textContent = 'last: ' + (j.last_seen.NO_SIGNAL || '-');
+@@
+-    """
++    """

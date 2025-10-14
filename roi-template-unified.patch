@@ -1,0 +1,515 @@
+diff --git a/boot_cycle_gui_web-macpc.py b/boot_cycle_gui_web-macpc.py
+--- a/boot_cycle_gui_web-macpc.py
++++ b/boot_cycle_gui_web-macpc.py
+@@ -10,16 +10,19 @@
+   Windows: <venv>\Scripts\Activate && python boot_cycle_gui_web.py
+   Windows: pyinstaller --noconfirm --onefile --noconsole ^
+-    --name BootCycleLogger ^
+-    --add-data "Scope-Disconnected.png;." ^
+-    --add-data "Scope-Connected-SidewinderCCU.png;." ^
+-    --add-data "Scope-Connected-OtherCCU.png;." ^
++    --name BootCycleLogger ^
++    --add-data "Scope-Disconnected.png;." ^
++    --add-data "Scope-Connected-SidewinderCCU.png;." ^
++    --add-data "Scope-Connected-OtherCCU.png;." ^
++    --add-data "art\\Boot-Reliabilty-Testing.png;art" ^
++    --add-data "templates;templates" ^
+     boot_cycle_gui_web-macpc.py
+ 
+   Build (macOS/Linux):
+   pyinstaller --noconfirm --onefile --noconsole \
+-    --name BootCycleLogger \
+-    --add-data "Scope-Disconnected.png:." \
+-    --add-data "Scope-Connected-SidewinderCCU.png:." \
+-    --add-data "Scope-Connected-OtherCCU.png:." \
++    --name BootCycleLogger \
++    --add-data "Scope-Disconnected.png:." \
++    --add-data "Scope-Connected-SidewinderCCU.png:." \
++    --add-data "Scope-Connected-OtherCCU.png:." \
++    --add-data "art/Boot-Reliabilty-Testing.png:art" \
++    --add-data "templates:templates" \
+     boot_cycle_gui_web-macpc.py
+ """
+ 
+@@ -27,7 +30,7 @@
+ import os, sys, threading, time, csv, platform, webbrowser, subprocess
+ from datetime import datetime
+-from flask import Flask, jsonify, request, render_template_string, Response, send_file
++from flask import Flask, jsonify, request, render_template_string, render_template, Response, send_file
+ import cv2, numpy as np
+ from PIL import Image
+ import imagehash as ih
+ 
+@@ -39,6 +42,12 @@
+ # ---- Resolve app directory for data files (works in PyInstaller and from source) ----
+ APP_DIR = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+ 
++# Template/static directories (work both in source and PyInstaller bundle)
++TEMPLATE_DIR = os.path.join(APP_DIR, "templates")
++STATIC_DIR   = os.path.join(APP_DIR, "static")
++
++# Ensure art folder path (for new ROI reference)
++ART_DIR = os.path.join(APP_DIR, "art")
+ 
+ # Helper to stringify FOURCC integer to string
+ def _fourcc_to_str(v:int) -> str:
+@@ -58,10 +67,12 @@
+ THUMB_H = 144
+ 
+-# Reference images + CSV
+-BARS_REF = "Comp-Scope-Disconnected-ColorBars.png"
+-INT_REF  = "Comp-Still-&-Video-capture-disabled.png"
++# Reference images + CSV
++# Keep the 'bars' reference if you still use it, but Device Connected will now be ROI-only to the testing image:
++BARS_REF = "Scope-Disconnected.png"
++# NEW: ROI connected reference inside /art
++INT_REF  = os.path.join(ART_DIR, "Boot-Reliabilty-Testing.png")
+ INT_REF2 = "Scope-Connected-OtherCCU.png"  # kept for compatibility; not used by ROI detector
+-CSV_PATH = os.path.join("logs", f"boot_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
++CSV_PATH = os.path.join(APP_DIR, "logs", f"boot_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
+ 
+ # Video source & capture options
+ SRC         = "1"           # OBS virtual cam on mac; Windows often "0" or "1"
+@@ -97,6 +108,46 @@
+     return cv2.resize(g, (THUMB_W, THUMB_H))
+ 
++# ---------- ROI detector for "Device Connected" using Boot-Reliabilty-Testing.png ----------
++# The reference has a 400x400 white square bottom-aligned, 420px from the left on a 1920x1080 canvas.
++# We compute ROI in proportional coordinates so any input resolution works.
++BASE_W, BASE_H = 1920, 1080
++ROI_BOX = dict(x=420, y=BASE_H - 400, w=400, h=400)  # (x,y) is top-left in baseline space
++
++def _roi_box_for_frame(w:int, h:int):
++    sx = w / float(BASE_W)
++    sy = h / float(BASE_H)
++    x = int(round(ROI_BOX["x"] * sx))
++    y = int(round(ROI_BOX["y"] * sy))
++    rw = int(round(ROI_BOX["w"] * sx))
++    rh = int(round(ROI_BOX["h"] * sy))
++    # clamp
++    x = max(0, min(x, max(0, w-1)))
++    y = max(0, min(y, max(0, h-1)))
++    if x+rw > w: rw = w - x
++    if y+rh > h: rh = h - y
++    return x, y, max(1, rw), max(1, rh)
++
++def roi_connected_gray(bgr):
++    """Extract the connected-ROI region, grayscale it, and return a square for stable pHash."""
++    h, w = bgr.shape[:2]
++    x,y,rw,rh = _roi_box_for_frame(w,h)
++    roi = bgr[y:y+rh, x:x+rw]
++    if roi.size == 0:
++        # fallback: grayscale full frame (shouldn't happen unless tiny frame)
++        roi = bgr
++    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
++    # normalize size for consistent hashing
++    return cv2.resize(gray, (256,256), interpolation=cv2.INTER_AREA)
++
++def ph_int_ref(path):
++    img = cv2.imread(path)
++    if img is None:
++        raise RuntimeError(f"Failed to read INT reference image: {path}")
++    return ih.phash(Image.fromarray(roi_connected_gray(img)))
+ 
+ def ph(gray_crop):
+     return ih.phash(Image.fromarray(gray_crop))
+ 
+@@ -117,7 +168,7 @@
+ def label_for(state):
+-    return "Device Not Connected" if state=="BARS" else "Device Connected" if state=="INTERFACE" else "No Signal"
++    return "Device Not Connected" if state=="BARS" else "Device Connected" if state=="INTERFACE" else "No Signal"
+ 
+ class Monitor:
+     def __init__(self):
+@@ -269,17 +320,25 @@
+ def decide(frame, bars_h, int_h, center_w, thresh, dmean, dstd):
+-    cg = crop(frame, center_w)
+-    phv = ph(cg)
+-    db, di = phv - bars_h, phv - int_h
++    # For 'bars' we keep the existing center/side crop logic
++    cg = crop(frame, center_w)
++    phv_bars = ph(cg)
++    db = phv_bars - bars_h
++
++    # For 'Device Connected' we compare ONLY the ROI phash against Boot-Reliabilty-Testing.png
++    roi = roi_connected_gray(frame)
++    phv_int = ih.phash(Image.fromarray(roi))
++    di = phv_int - int_h
++
+     mean_lum = float(np.mean(cg)); std_lum = float(np.std(cg))
+     is_dark_flat = (mean_lum < dmean) and (std_lum < dstd)
+     if (db < thresh) and (not is_dark_flat):
+         det = "BARS"
+     elif di < thresh:
+         det = "INTERFACE"
+     else:
+-        det = "OTHER"
+-    return det, int(db), int(di), cg, mean_lum, std_lum
++        det = "OTHER"
++    # return cg as the live thumbnail source; roi is used only for INT detection
++    return det, int(db), int(di), cg, mean_lum, std_lum
+ 
+ def run_loop():
+     try:
+-        bars_h = ph_ref(mon.bars_ref, mon.center_w)
+-        int_h  = ph_ref(mon.int_ref,  mon.center_w)
++        bars_h = ph_ref(mon.bars_ref, mon.center_w)
++        int_h  = ph_int_ref(mon.int_ref)   # ROI-based reference for Device Connected
+     except Exception as e:
+         with mon.lock:
+             mon.status = f"error: {e}"
+@@ -431,7 +490,7 @@
+             if not ok:
+                 time.sleep(0.05)
+                 continue
+-            det, db, di, crop_img, mean_l, std_l = decide(frame, bars_h, int_h, cw, thr, dmean, dstd)
++            det, db, di, crop_img, mean_l, std_l = decide(frame, bars_h, int_h, cw, thr, dmean, dstd)
+ 
+             with mon.lock:
+                 # update live artifacts
+@@ -458,7 +517,7 @@
+             if not changed:
+                 time.sleep(0.05)
+ 
+-# ---------- web app ----------
+-app = Flask(__name__)
++# ---------- web app ----------
++app = Flask(__name__, template_folder=TEMPLATE_DIR, static_folder=STATIC_DIR)
+ 
+ HTML = """
+ <!doctype html>
+@@ -737,12 +796,19 @@
+ 
+ @app.get("/")
+ def index():
+-    return render_template_string(HTML,
+-        src=mon.src, cw=mon.center_w, thr=mon.thresh, st=mon.stable_frames,
+-        dm=mon.dark_mean, ds=mon.dark_std, bars=mon.bars_ref, intr=mon.int_ref, intr2=mon.int_ref2,
+-        csv=mon.csv_path, stream=mon.stream_path, backend=mon.backend_name,
+-        fourcc=mon.fourcc, res=mon.res_preset
+-    )
++    context = dict(
++        src=mon.src, cw=mon.center_w, thr=mon.thresh, st=mon.stable_frames,
++        dm=mon.dark_mean, ds=mon.dark_std, bars=mon.bars_ref, intr=mon.int_ref, intr2=mon.int_ref2,
++        csv=mon.csv_path, stream=mon.stream_path, backend=mon.backend_name,
++        fourcc=mon.fourcc, res=mon.res_preset
++    )
++    tpl_path = os.path.join(TEMPLATE_DIR, "index.html")
++    if os.path.exists(tpl_path):
++        return render_template("index.html", **context)
++    else:
++        # Fallback to embedded HTML if template file missing
++        return render_template_string(HTML, **context)
+ 
+ @app.get("/ping")
+ def ping():
+@@ -809,7 +875,7 @@
+     try:
+-        bars_h = ph_ref(bars_path, cw)
+-        int_h  = ph_ref(int_path,  cw)
++        bars_h = ph_ref(bars_path, cw)
++        int_h  = ph_int_ref(int_path)
+     except Exception as e:
+         return jsonify(error=f"ref load: {e}")
+ 
+diff --git a/templates/index.html b/templates/index.html
+new file mode 100644
+--- /dev/null
++++ b/templates/index.html
+@@ -0,0 +1,260 @@
++<!doctype html>
++<html>
++<head>
++  <meta charset="utf-8"/>
++  <title>Boot Cycle Logger</title>
++  <style>
++    :root {
++      --bg:#0f172a; --text:#e5e7eb; --card:#111827; --border:#1f2937;
++      --btn:#38bdf8; --btnText:#0b1220; --btn2:#1f2937; --muted:#94a3b8;
++      --btn2Hover:#374151;
++      --pillIdle:#334155;           /* slate */
++      --pillConnected:#16a34a;      /* green */
++      --pillNotConnected:#dc2626;   /* red */
++      --pillOther:#eab308;          /* amber */
++      --btnDisabled:#334155; --btnDisabledText:#a3a3a3;
++    }
++    * { box-sizing:border-box }
++    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin:24px; background:var(--bg); color:var(--text); }
++    h1 { color:var(--btn); margin-top:0 }
++    .card { background:var(--card); border:1px solid var(--border); border-radius:12px; padding:16px; margin:12px 0; }
++    .row { display:flex; gap:16px; flex-wrap:wrap; }
++    .stat { flex:1 1 220px; background:#0b1220; border:1px solid var(--border); border-radius:10px; padding:12px; }
++    .label { color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.08em; }
++    .value { font-size:28px; font-weight:700; }
++    .sub { color:var(--muted); font-size:12px; margin-top:6px; }
++    button {
++      background:var(--btn); color:var(--btnText); font-weight:700; border:none; padding:10px 14px;
++      border-radius:8px; cursor:pointer; transition:all .15s ease; outline: none;
++    }
++    button:hover { filter:brightness(1.06); transform:translateY(-1px); }
++    button:active { transform:translateY(0px) scale(0.99); }
++    button.secondary { background:var(--btn2); color:var(--text); }
++    button.secondary:hover { background:var(--btn2Hover); }
++    button:disabled { background:var(--btnDisabled); color:var(--btnDisabledText); cursor:not-allowed; transform:none; }
++    input, select { background:#0b1220; color:var(--text); border:1px solid var(--border); border-radius:6px; padding:8px; width:100%; }
++    .grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap:12px; }
++    .pill {
++      display:inline-flex; align-items:center; justify-content:center;
++      min-width: 320px; padding:18px 26px; border-radius:999px; font-weight:800; font-size:22px;
++      margin: 6px 0 14px 0; border:1px solid #00000022;
++      box-shadow: 0 6px 20px rgba(0,0,0,.25), inset 0 1px 0 rgba(255,255,255,.08);
++    }
++    .thumbBox { display:flex; gap:16px; align-items:center; }
++    .metrics { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size:14px; color:#cbd5e1; }
++  </style>
++</head>
++<body>
++  <h1>Boot Cycle Logger</h1>
++
++  <!-- BIG STATUS PILL -->
++  <div class="pill" id="statusPill" style="background: var(--pillIdle);">idle</div>
++
++  <div class="card">
++    <div class="grid">
++      <div><label>Source (index/URL)</label><input id="src" value="{{src}}"></div>
++      <div><label>Backend</label>
++        <select id="backend">
++        <option value="auto" {{ 'selected' if backend|lower=='auto' else '' }}>auto</option>
++        <option value="MSMF" {{ 'selected' if backend|lower=='msmf' else '' }}>MSMF (Windows)</option>
++        <option value="DSHOW" {{ 'selected' if backend|lower=='dshow' else '' }}>DSHOW (Windows)</option>
++        <option value="AVFOUNDATION" {{ 'selected' if backend|lower=='avfoundation' else '' }}>AVFOUNDATION (macOS)</option>
++        <option value="V4L2" {{ 'selected' if backend|lower=='v4l2' else '' }}>V4L2 (Linux)</option>
++        </select>
++      </div>
++      <div><label>FOURCC</label>
++        <select id="fourcc">
++          <option value="auto" {{ 'selected' if fourcc|lower=='auto' else '' }}>auto</option>
++          <option value="MJPG" {{ 'selected' if fourcc|upper=='MJPG' else '' }}>MJPG</option>
++          <option value="YUY2" {{ 'selected' if fourcc|upper=='YUY2' else '' }}>YUY2</option>
++        </select>
++      </div>
++      <div><label>Resolution</label>
++        <select id="res">
++            <option value="1080p" {{ 'selected' if res|lower=='1080p' else '' }}>1080p</option>
++            <option value="720p"  {{ 'selected' if res|lower=='720p'  else '' }}>720p</option>
++        </select>
++      </div>
++      <div><label>Stream URL (rtsp/http)</label><input id="stream" placeholder="rtsp://user:pass@host:554/stream" value="{{stream}}"></div>
++      <div><label>Center Width <span style="color:var(--muted);font-size:12px">(set ≥ video width to disable crop)</span></label><input id="cw" type="number" value="{{cw}}"></div>
++      <div><label>Threshold</label><input id="thr" type="number" value="{{thr}}"></div>
++      <div><label>Stable Frames</label><input id="st" type="number" value="{{st}}"></div>
++      <div><label>Dark Mean</label><input id="dm" type="number" value="{{dm}}"></div>
++      <div><label>Dark Std</label><input id="ds" type="number" value="{{ds}}"></div>
++      <div><label>Device Disconnected Ref</label><input id="bars" value="{{bars}}"></div>
++      <div><label>Scope Connected Ref</label><input id="intr" value="{{intr}}"></div>
++      <div><label>Scope Connected (Alt) Ref</label><input id="intr2" value="{{intr2}}"></div>
++      <div><label>CSV Path</label><input id="csv" value="{{csv}}"></div>
++    </div>
++    <div style="margin-top:12px; display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
++      <button id="btnStart" onclick="start()">Start</button>
++      <button id="btnStop"  class="secondary" onclick="stop()">Stop</button>
++      <button id="btnClear" class="secondary" onclick="clearCounts()">Clear &amp; New CSV</button>
++      <button id="btnResetTallies" class="secondary" onclick="resetTallies()">Reset tallies</button>
++      <button id="btnProbe" class="secondary" onclick="probe()">Probe source</button>
++      <label style="display:flex; align-items:center; gap:6px; font-size:13px; color:var(--muted);">
++        <input id="liveCropToggle" type="checkbox" checked onchange="toggleThumb()"/>
++        Live crop
++      </label>
++      <div style="flex:1"></div>
++      <button class="secondary" onclick="window.location.href='/download'">Download CSV</button>
++      <button class="secondary" onclick="shutdown()">Quit</button>
++    </div>
++
++    <!-- Probe output panel -->
++    <div class="card" style="margin-top:10px; background:#0b1220; color:#9ca3af; font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size:13px;">
++      <div style="display:flex; justify-content:space-between; align-items:center;">
++        <span style="font-weight:700; color:#38bdf8;">Probe Results</span>
++        <button class="secondary" onclick="document.getElementById('probeOut').textContent=''">Clear</button>
++      </div>
++      <pre id="probeOut" style="white-space:pre-wrap; margin-top:8px;"></pre>
++    </div>
++  </div>
++
++  <div class="card thumbBox">
++    <div>
++      <img id="thumb" src="" alt="live crop" width="256" height="144" style="border-radius:8px; border:1px solid var(--border)"/>
++    </div>
++    <div class="metrics">
++      <div><b>Test Frame</b></div>
++      <div id="m_db">bars distance: -</div>
++      <div id="m_di">interface distance: -</div>
++      <div id="m_mean">mean luminance: -</div>
++      <div id="m_std">std luminance: -</div>
++      <div style="margin-top:8px;">
++        <button class="secondary" onclick="peek()">Test frame now</button>
++      </div>
++      <div style="margin-top:8px; color:#9ca3af; font-size:12px;">Tip: if bars/interface distances are close to the threshold, adjust Threshold or Center Width. Dark/flat frames should fail bars by the dark gates.</div>
++    </div>
++  </div>
++
++  <div class="row">
++    <div class="stat"><div class="label">Status</div><div id="status" class="value">idle</div></div>
++    <div class="stat"><div class="label">Not Connected</div><div id="barsCount" class="value">0</div><div class="sub" id="barsSeen">last: -</div></div>
++    <div class="stat"><div class="label">Connected</div><div id="intCount" class="value">0</div><div class="sub" id="intSeen">last: -</div></div>
++    <div class="stat"><div class="label">No Signal</div><div id="otherCount" class="value">0</div><div class="sub" id="otherSeen">last: -</div></div>
++    <div class="stat"><div class="label">Cycles</div><div id="cyclesCount" class="value">0</div></div>
++  </div>
++
++  <script>
++    console.log('✅ Boot Cycle Logger front-end script loaded');
++    let backendInit = false;
++    let fourccInit = false;
++    let resInit = false;
++    function paintPill(text){
++      const pill = document.getElementById('statusPill');
++      pill.textContent = text;
++      let bg = 'var(--pillIdle)';
++      const t = (text || '').toLowerCase();
++      if (t.includes('connected') && !t.includes('not')) bg = 'var(--pillConnected)';
++      else if (t.includes('not connected')) bg = 'var(--pillNotConnected)';
++      else if (t.includes('no signal')) bg = 'var(--pillOther)';
++      pill.style.background = bg;
++    }
++    function bust(url){ return url + (url.includes('?')?'&':'?') + 't=' + Date.now(); }
++
++    // Thumbnail refresh logic
++    let thumbEnabled = true;
++    function refreshThumb(){
++      if(!thumbEnabled) return;
++      const el = document.getElementById('thumb');
++      el.src = bust('/thumb');
++    }
++    function toggleThumb(){
++      const cb = document.getElementById('liveCropToggle');
++      thumbEnabled = !!cb.checked;
++      if(thumbEnabled) refreshThumb();
++    }
++
++    async function probe(){
++      const body = {
++        src:  document.getElementById('src').value,
++        backend: document.getElementById('backend').value,
++        fourcc: document.getElementById('fourcc').value,
++        res:    document.getElementById('res').value,
++        stream: document.getElementById('stream').value
++      };
++      try{
++        const r = await fetch('/probe', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
++        const j = await r.json();
++        const el = document.getElementById('probeOut');
++        if(j.error){
++          el.textContent = 'Probe error: ' + j.error;
++        }else if(j.results){
++          const lines = [];
++          if (j.note) lines.push(j.note);
++          for(const item of j.results){
++            lines.push(
++              (item.backend || '') + ' idx=' + (item.index !== undefined && item.index !== null ? item.index : '') +
++              ' opened=' + item.opened +
++              ' size=' + (item.size || '-') +
++              ' fourcc=' + (item.fourcc || '-') +
++              ' fps=' + (item.fps || '-')
++            );
++          }
++          el.textContent = lines.join('\\n');
++        }else{
++          el.textContent = 'No results';
++        }
++      }catch(e){
++        document.getElementById('probeOut').textContent = 'Probe failed: ' + e;
++      }
++    }
++
++    async function getStatus(){
++      const r = await fetch('/status'); const j = await r.json();
++      const display = j.status_friendly || j.status;
++      document.getElementById('status').textContent = display;
++      document.getElementById('barsCount').textContent   = j.count_bars;
++      document.getElementById('intCount').textContent    = j.count_int;
++      document.getElementById('otherCount').textContent  = j.count_other;
++      document.getElementById('cyclesCount').textContent = j.cycles;
++      document.getElementById('barsSeen').textContent  = 'last: ' + (j.last_seen.BARS || '-');
++      document.getElementById('intSeen').textContent   = 'last: ' + (j.last_seen.INTERFACE || '-');
++      document.getElementById('otherSeen').textContent = 'last: ' + (j.last_seen.OTHER || '-');
++      paintPill(display);
++      if (!backendInit) {
++        document.getElementById('backend').value = (j.backend || 'auto');
++        backendInit = true;
++      }
++      if (!fourccInit) {
++        document.getElementById('fourcc').value = (j.fourcc || 'auto');
++        fourccInit = true;
++      }
++      if (!resInit) {
++        document.getElementById('res').value = (j.res_preset || '1080p');
++        resInit = true;
++      }
++      const running = !!j.running;
++      document.getElementById('btnStart').disabled = running;
++      document.getElementById('btnStop').disabled  = !running;
++      document.getElementById('btnClear').disabled = running;
++    }
++
++    async function peek(){
++      const r = await fetch('/peek'); const j = await r.json();
++      document.getElementById('m_db').textContent   = 'bars distance: ' + j.db;
++      document.getElementById('m_di').textContent   = 'interface distance: ' + j.di;
++      document.getElementById('m_mean').textContent = 'mean luminance: ' + j.mean;
++      document.getElementById('m_std').textContent  = 'std luminance: ' + j.std;
++    }
++
++    async function start(){
++      const body = {
++        src:  document.getElementById('src').value,
++        backend: document.getElementById('backend').value,
++        fourcc: document.getElementById('fourcc').value,
++        res:    document.getElementById('res').value,
++        stream: document.getElementById('stream').value,
++        cw:   parseInt(document.getElementById('cw').value),
++        thr:  parseInt(document.getElementById('thr').value),
++        st:   parseInt(document.getElementById('st').value),
++        dm:   parseFloat(document.getElementById('dm').value),
++        ds:   parseFloat(document.getElementById('ds').value),
++        bars: document.getElementById('bars').value,
++        intr: document.getElementById('intr').value,
++        intr2: document.getElementById('intr2').value,
++        csv:  document.getElementById('csv').value,
++      };
++      await fetch('/start', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
++      setTimeout(getStatus, 300);
++    }
++    async function stop(){ await fetch('/stop', {method:'POST'}); setTimeout(getStatus, 300); }
++    async function clearCounts(){ await fetch('/clear', {method:'POST'}); setTimeout(getStatus, 300); }
++    async function resetTallies(){
++      await fetch('/reset_tallies', {method:'POST'});
++      setTimeout(getStatus, 200);
++    }
++    async function shutdown(){ await fetch('/shutdown', {method:'POST'}); }
++    // Expose functions to global scope
++    window.probe = probe;
++    window.getStatus = getStatus;
++    window.peek = peek;
++    window.start = start;
++    window.stop = stop;
++    window.clearCounts = clearCounts;
++    window.resetTallies = resetTallies;
++    window.shutdown = shutdown;
++    window.toggleThumb = toggleThumb;
++    window.refreshThumb = refreshThumb;
++    setInterval(getStatus, 600);
++    setInterval(refreshThumb, 1500); // decoupled from status polling
++    getStatus();
++    // Guards
++    if (typeof window.probe !== 'function') window.probe = probe;
++    if (typeof window.getStatus !== 'function') window.getStatus = getStatus;
++    if (typeof window.peek !== 'function') window.peek = peek;
++    if (typeof window.start !== 'function') window.start = start;
++    if (typeof window.stop !== 'function') window.stop = stop;
++    if (typeof window.clearCounts !== 'function') window.clearCounts = clearCounts;
++    if (typeof window.resetTallies !== 'function') window.resetTallies = resetTallies;
++    if (typeof window.shutdown !== 'function') window.shutdown = shutdown;
++    if (typeof window.toggleThumb !== 'function') window.toggleThumb = toggleThumb;
++    if (typeof window.refreshThumb !== 'function') window.refreshThumb = refreshThumb;
++  </script>
++</body>
++</html>
