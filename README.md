@@ -10,8 +10,12 @@ It detects transitions between five main states:
 - **Other** – any unrecognized state
 
 ## Features
-- Web interface for live status, showing both the full frame and a 400×400 px ROI thumbnail at true aspect ratios; the ROI is positioned 420 px from the bottom left  
-- Automatic CSV logging of state transitions and cycle counts  
+- Support for **6 simultaneous video channels** arranged in a 3x2 layout, each with independent ROI detection and state tracking  
+- Redesigned web interface featuring a **2/3 video display**, per-channel status pills, and per-channel state tallies  
+- Adjustable **ROI brightness threshold** and **mean gate** controls for fine-tuning detection parameters  
+- Ability to adjust ROI **internal padding/inset** for improved detection accuracy  
+- Live CSV logging per channel with **timestamped filenames**, including controls to reset tallies and download logs  
+- Debug overlay support for visualizing ROI positions on video feeds  
 - Image-based state detection with support for multiple reference images for the connected state  
 - Improved backend detection and fallback handling on macOS, including Source 2 and AVFoundation backends  
 - Ready-to-build scripts for macOS (`build-mac.sh`) and Windows (`build-win.ps1`)
@@ -53,6 +57,16 @@ Windows (Powershell)
 ---
 
 # CHANGELOG.md
+
+## [2025-10-14]
+
+### Added
+- Support for 6 simultaneous video channels arranged in a 3x2 layout with independent ROI detection and state tracking.
+- Redesigned UI featuring a 2/3 video display, per-channel status pills, and per-channel state tallies.
+- Adjustable ROI brightness threshold and mean gate controls for fine-tuning detection.
+- Ability to adjust ROI internal padding/inset for better detection accuracy.
+- Live CSV logging per channel with timestamped filenames, reset tallies button, and download button.
+- Debug overlay support for visualizing ROI positions on video feeds.
 
 ## [Unreleased] - 2024-06-06
 
