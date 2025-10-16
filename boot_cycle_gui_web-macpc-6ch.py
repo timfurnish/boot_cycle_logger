@@ -29,6 +29,7 @@ Build (macOS/Linux):
 """
 
 import os, sys, threading, time, csv, platform, webbrowser, subprocess
+from typing import Optional
 
 # ---- Ensure chosen port is free (best-effort cross‑platform) ----
 def _free_port(port:int):
@@ -488,6 +489,19 @@ class Monitor:
         self._int_h_list = None
         self._ref_mean = None
         self._ref_bright = None
+        
+        # Console and scope metadata for logging
+        # consoles: {1: {serial: str, scope_id: str}, 2: {...}, 3: {...}}
+        self.consoles = {}
+        
+        # Enhanced state tracking per tile
+        # tile_state_history: list of {video, timestamp, state, console_serial, scope_id}
+        self.tile_state_history = []
+        self.test_start_time = None  # timestamp of first state change
+        
+        # Counters per state type per video channel
+        # Format: {video_num: {connected: count, disconnected: count, no_signal: count}}
+        self.state_tallies = {i: {"connected": 0, "disconnected": 0, "no_signal": 0} for i in range(1, 7)}
 
     def _resolve_backend(self):
         name = (self.backend_name or "auto").strip().lower()
@@ -516,6 +530,10 @@ class Monitor:
         # new timestamped CSV on each clear
         self.csv_path = os.path.join(LOG_ROOT, f"boot_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
         self.await_connect = True
+        # Reset new tracking fields
+        self.tile_state_history = []
+        self.test_start_time = None
+        self.state_tallies = {i: {"connected": 0, "disconnected": 0, "no_signal": 0} for i in range(1, 7)}
 
     def reset_tallies(self):
         """Zero counters and last-seen timestamps without rolling the CSV file."""
@@ -530,6 +548,10 @@ class Monitor:
         self.await_connect = True
         self.tile_last   = ["UNKNOWN"] * GRID_FEEDS
         self.tile_counts = [0] * GRID_FEEDS
+        # Reset new tracking fields
+        self.tile_state_history = []
+        self.test_start_time = None
+        self.state_tallies = {i: {"connected": 0, "disconnected": 0, "no_signal": 0} for i in range(1, 7)}
 
 mon = Monitor()
 
@@ -538,22 +560,52 @@ def open_csv(path):
     f = open(path, "a", newline="")
     w = csv.writer(f)
     if f.tell()==0:
-        # event rows: one per tile transition to INTERFACE
-        w.writerow(["ts","event","video","count","bars_dist","int_dist","cycles"])
+        # Enhanced CSV header with console and scope metadata
+        w.writerow(["timestamp","video","state","console_num","console_serial","scope_id","bars_dist","int_dist","count","elapsed_sec"])
     return f, w
 
-def _csv_append(event:str, video:int, count:int, bars_dist:int=None, int_dist:int=None, cycles:int=None):
+def _csv_append_state_change(video:int, state:str, bars_dist:Optional[int]=None, int_dist:Optional[int]=None, count:Optional[int]=None):
     """
-    Append a single event row to the current CSV (safe to call from UI helpers).
-    Columns: ts, event, video, count, bars_dist, int_dist, cycles
+    Append a state change event to CSV with full metadata.
+    Columns: timestamp, video, state, console_num, console_serial, scope_id, bars_dist, int_dist, count, elapsed_sec
     """
     try:
         os.makedirs(os.path.dirname(mon.csv_path) or ".", exist_ok=True)
-        ts = datetime.now().isoformat(timespec="seconds")
+        ts = datetime.now()
+        timestamp_str = ts.isoformat(timespec="milliseconds")
+        
+        # Map video to console: Videos 1-2 = Console 1, 3-4 = Console 2, 5-6 = Console 3
+        console_num = ((video - 1) // 2) + 1
+        console_data = mon.consoles.get(console_num, {})
+        console_serial = console_data.get("serial", "")
+        scope_id = console_data.get("scope_id", "")
+        
+        # Calculate elapsed time since test start
+        elapsed_sec = 0.0
+        if mon.test_start_time:
+            elapsed_sec = (ts - mon.test_start_time).total_seconds()
+        else:
+            mon.test_start_time = ts
+            
+        # Store in history for report generation
+        mon.tile_state_history.append({
+            "timestamp": ts,
+            "video": video,
+            "state": state,
+            "console_num": console_num,
+            "console_serial": console_serial,
+            "scope_id": scope_id,
+            "bars_dist": bars_dist,
+            "int_dist": int_dist,
+            "elapsed_sec": elapsed_sec
+        })
+        
         with open(mon.csv_path, "a", newline="") as _f:
             _w = csv.writer(_f)
-            _w.writerow([ts, event, video, count, bars_dist, int_dist, cycles])
-    except Exception:
+            _w.writerow([timestamp_str, video, state, console_num, console_serial, scope_id, 
+                        bars_dist, int_dist, count, round(elapsed_sec, 3)])
+    except Exception as e:
+        print(f"Error appending to CSV: {e}")
         pass
 
 def _composite_thumb_from_frame(bgr):
@@ -1066,6 +1118,158 @@ def run_loop():
                 mon.running = False
             mon.worker = None
 
+def generate_test_report():
+    """
+    Generate a comprehensive test report with:
+    - State change tallies per video
+    - Average disconnect-to-connect times
+    - Inconsistency detection (disconnects not followed by connects)
+    Returns: dict with report data
+    """
+    report = {
+        "test_start": mon.test_start_time.isoformat() if mon.test_start_time else "N/A",
+        "test_end": datetime.now().isoformat(),
+        "total_duration_sec": 0.0,
+        "videos": {},
+        "inconsistencies": [],
+        "summary": {}
+    }
+    
+    if mon.test_start_time:
+        report["total_duration_sec"] = (datetime.now() - mon.test_start_time).total_seconds()
+    
+    # Analyze each video channel
+    for video_num in range(1, 7):
+        console_num = ((video_num - 1) // 2) + 1
+        console_data = mon.consoles.get(console_num, {})
+        
+        video_report = {
+            "video": video_num,
+            "console_num": console_num,
+            "console_serial": console_data.get("serial", "N/A"),
+            "scope_id": console_data.get("scope_id", "N/A"),
+            "tallies": mon.state_tallies.get(video_num, {"connected": 0, "disconnected": 0, "no_signal": 0}),
+            "disconnect_to_connect_times": [],
+            "avg_disconnect_to_connect_sec": None
+        }
+        
+        # Find disconnect-to-connect times for this video
+        video_history = [h for h in mon.tile_state_history if h["video"] == video_num]
+        
+        last_disconnect_time = None
+        for i, event in enumerate(video_history):
+            if event["state"] == "Scope Disconnected":
+                last_disconnect_time = event["timestamp"]
+                
+                # Check if next event is NOT a connect (inconsistency)
+                if i + 1 < len(video_history):
+                    next_event = video_history[i + 1]
+                    if next_event["state"] != "Scope Connected":
+                        report["inconsistencies"].append({
+                            "video": video_num,
+                            "console_serial": event["console_serial"],
+                            "scope_id": event["scope_id"],
+                            "disconnect_time": event["timestamp"].isoformat(),
+                            "next_state": next_event["state"],
+                            "issue": f"Disconnected at {event['timestamp'].strftime('%H:%M:%S.%f')[:-3]} was followed by '{next_event['state']}' instead of 'Scope Connected'"
+                        })
+                elif i + 1 >= len(video_history):
+                    # Last event was disconnect with no subsequent connect
+                    report["inconsistencies"].append({
+                        "video": video_num,
+                        "console_serial": event["console_serial"],
+                        "scope_id": event["scope_id"],
+                        "disconnect_time": event["timestamp"].isoformat(),
+                        "next_state": "END OF TEST",
+                        "issue": f"Disconnected at {event['timestamp'].strftime('%H:%M:%S.%f')[:-3]} was never followed by reconnection"
+                    })
+                    
+            elif event["state"] == "Scope Connected" and last_disconnect_time:
+                # Calculate time from disconnect to connect
+                delta_sec = (event["timestamp"] - last_disconnect_time).total_seconds()
+                video_report["disconnect_to_connect_times"].append(delta_sec)
+                last_disconnect_time = None
+        
+        # Calculate average
+        if video_report["disconnect_to_connect_times"]:
+            video_report["avg_disconnect_to_connect_sec"] = sum(video_report["disconnect_to_connect_times"]) / len(video_report["disconnect_to_connect_times"])
+        
+        report["videos"][video_num] = video_report
+    
+    # Overall summary
+    total_connected = sum(v["tallies"]["connected"] for v in report["videos"].values())
+    total_disconnected = sum(v["tallies"]["disconnected"] for v in report["videos"].values())
+    total_no_signal = sum(v["tallies"]["no_signal"] for v in report["videos"].values())
+    
+    all_disconnect_times = []
+    for v in report["videos"].values():
+        all_disconnect_times.extend(v["disconnect_to_connect_times"])
+    
+    report["summary"] = {
+        "total_state_changes": len(mon.tile_state_history),
+        "total_connected_events": total_connected,
+        "total_disconnected_events": total_disconnected,
+        "total_no_signal_events": total_no_signal,
+        "total_inconsistencies": len(report["inconsistencies"]),
+        "avg_all_disconnect_to_connect_sec": sum(all_disconnect_times) / len(all_disconnect_times) if all_disconnect_times else None
+    }
+    
+    return report
+
+def format_report_text(report):
+    """Format the report as human-readable text."""
+    lines = []
+    lines.append("=" * 80)
+    lines.append("BOOT CYCLE TEST REPORT")
+    lines.append("=" * 80)
+    lines.append(f"Test Start:    {report['test_start']}")
+    lines.append(f"Test End:      {report['test_end']}")
+    lines.append(f"Duration:      {report['total_duration_sec']:.1f} seconds ({report['total_duration_sec']/60:.1f} minutes)")
+    lines.append("")
+    
+    # Summary
+    lines.append("SUMMARY")
+    lines.append("-" * 80)
+    s = report["summary"]
+    lines.append(f"Total State Changes:        {s['total_state_changes']}")
+    lines.append(f"Total Connected Events:     {s['total_connected_events']}")
+    lines.append(f"Total Disconnected Events:  {s['total_disconnected_events']}")
+    lines.append(f"Total No Signal Events:     {s['total_no_signal_events']}")
+    lines.append(f"Total Inconsistencies:      {s['total_inconsistencies']}")
+    if s['avg_all_disconnect_to_connect_sec']:
+        lines.append(f"Avg Disconnect→Connect:     {s['avg_all_disconnect_to_connect_sec']:.2f} seconds")
+    lines.append("")
+    
+    # Per-video details
+    lines.append("PER-VIDEO DETAILS")
+    lines.append("-" * 80)
+    for video_num in sorted(report["videos"].keys()):
+        v = report["videos"][video_num]
+        lines.append(f"\nVIDEO {video_num} (Console {v['console_num']})")
+        lines.append(f"  Console Serial: {v['console_serial']}")
+        lines.append(f"  Scope ID:       {v['scope_id']}")
+        lines.append(f"  Connected:      {v['tallies']['connected']} times")
+        lines.append(f"  Disconnected:   {v['tallies']['disconnected']} times")
+        lines.append(f"  No Signal:      {v['tallies']['no_signal']} times")
+        if v['avg_disconnect_to_connect_sec']:
+            lines.append(f"  Avg Disc→Conn:  {v['avg_disconnect_to_connect_sec']:.2f} seconds")
+        else:
+            lines.append(f"  Avg Disc→Conn:  N/A (no complete cycles)")
+    
+    # Inconsistencies
+    if report["inconsistencies"]:
+        lines.append("")
+        lines.append("INCONSISTENCIES DETECTED")
+        lines.append("-" * 80)
+        for i, inc in enumerate(report["inconsistencies"], 1):
+            lines.append(f"\n{i}. VIDEO {inc['video']} (Console Serial: {inc['console_serial']}, Scope: {inc['scope_id']})")
+            lines.append(f"   {inc['issue']}")
+    
+    lines.append("")
+    lines.append("=" * 80)
+    
+    return "\n".join(lines)
+
 # ---------- web app ----------
 app = Flask(__name__, template_folder=TEMPLATE_DIR, static_folder=STATIC_DIR)
 
@@ -1074,6 +1278,26 @@ def index():
     # Always serve the modern 2/3 (video) + 1/3 (controls) layout with a 6‑pill status grid.
     # We deliberately do NOT render templates/index.html anymore to avoid old UI showing up.
     return """<!doctype html><html><head><meta charset='utf-8'><title>Boot Cycle Logger 6‑ch</title>
+    <style>
+    /* Modal styles */
+    .modal { display: none; position: fixed; z-index: 1000; left: 0; top: 0; width: 100%; height: 100%; 
+             background-color: rgba(0,0,0,0.6); overflow: auto; }
+    .modal.show { display: block; }
+    .modal-content { background-color: var(--panel); margin: 5% auto; padding: 30px; border: 1px solid var(--border); 
+                     width: 90%; max-width: 600px; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.5); }
+    .modal-header { font-size: 24px; font-weight: 700; color: var(--btn); margin-bottom: 20px; }
+    .modal-close { color: var(--muted); float: right; font-size: 28px; font-weight: bold; cursor: pointer; }
+    .modal-close:hover { color: var(--text); }
+    .console-section { margin-bottom: 24px; padding: 16px; background: var(--bg); border-radius: 8px; border: 1px solid var(--border); }
+    .console-title { font-size: 16px; font-weight: 700; color: var(--btn); margin-bottom: 12px; }
+    .form-row { margin-bottom: 12px; }
+    .form-row label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+    .form-row input { width: 100%; padding: 8px; border-radius: 6px; background: var(--panel); 
+                      color: var(--text); border: 1px solid var(--border); box-sizing: border-box; }
+    .report-text { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; 
+                   white-space: pre-wrap; background: var(--bg); padding: 16px; border-radius: 8px; 
+                   max-height: 500px; overflow-y: auto; color: var(--text); border: 1px solid var(--border); }
+    </style>
     <style>
     :root{
       --bg:#0f172a; --panel:#0b1220; --border:#1f2937; --text:#e5e7eb; --muted:#94a3b8;
@@ -1122,14 +1346,74 @@ def index():
         <div class='row'><label>ROI mean gate (0-255, overrides auto)</label><input id='mean_gate' value=''></div>
         <div class='row'><label>ROI inset px (shrink ROI)</label><input id='roi_inset' value='0'></div>
         <div class='row' style='display:flex;gap:8px;flex-wrap:wrap'>
+          <button onclick='showSetupModal()'>Setup Test</button>
           <button onclick='start()'>Start</button>
+          <button class='secondary' onclick='stopAndReport()'>Stop & Report</button>
           <button class='secondary' onclick='stop()'>Stop</button>
+          <button class='secondary' onclick='showReport()'>View Report</button>
           <button class='secondary' onclick='probe()'>Probe source</button>
           <button class='secondary' onclick='resetTallies()'>Reset tallies</button>
           <a id='dl' class='secondary' href='/download' style='text-decoration:none;display:inline-block;padding:10px 14px;border-radius:8px;'>Download CSV</a>
           <div id='csvInfo' style='font-size:12px;color:#94a3b8;margin-top:6px'>CSV: <code id='csvName'>-</code></div>
         </div>
         <pre id='probeOut'></pre>
+      </div>
+    </div>
+    
+    <!-- Setup Modal -->
+    <div id='setupModal' class='modal'>
+      <div class='modal-content'>
+        <span class='modal-close' onclick='closeSetupModal()'>&times;</span>
+        <div class='modal-header'>Test Setup - Console & Scope Information</div>
+        <p style='color:var(--muted);margin-bottom:20px;'>Enter serial numbers and scope IDs for each console before starting the test.</p>
+        
+        <div class='console-section'>
+          <div class='console-title'>Console 1 (Video 1 & 2)</div>
+          <div class='form-row'>
+            <label>Console Serial Number</label>
+            <input type='text' id='console1_serial' placeholder='Enter console serial number'>
+          </div>
+          <div class='form-row'>
+            <label>Scope ID</label>
+            <input type='text' id='console1_scope' placeholder='Enter scope ID'>
+          </div>
+        </div>
+        
+        <div class='console-section'>
+          <div class='console-title'>Console 2 (Video 3 & 4)</div>
+          <div class='form-row'>
+            <label>Console Serial Number</label>
+            <input type='text' id='console2_serial' placeholder='Enter console serial number'>
+          </div>
+          <div class='form-row'>
+            <label>Scope ID</label>
+            <input type='text' id='console2_scope' placeholder='Enter scope ID'>
+          </div>
+        </div>
+        
+        <div class='console-section'>
+          <div class='console-title'>Console 3 (Video 5 & 6)</div>
+          <div class='form-row'>
+            <label>Console Serial Number</label>
+            <input type='text' id='console3_serial' placeholder='Enter console serial number'>
+          </div>
+          <div class='form-row'>
+            <label>Scope ID</label>
+            <input type='text' id='console3_scope' placeholder='Enter scope ID'>
+          </div>
+        </div>
+        
+        <button onclick='saveConsoleMetadata()' style='width:100%;margin-top:12px;'>Save and Continue</button>
+      </div>
+    </div>
+    
+    <!-- Report Modal -->
+    <div id='reportModal' class='modal'>
+      <div class='modal-content' style='max-width:900px;'>
+        <span class='modal-close' onclick='closeReportModal()'>&times;</span>
+        <div class='modal-header'>Test Report</div>
+        <div id='reportContent' class='report-text'>Loading report...</div>
+        <button onclick='closeReportModal()' class='secondary' style='width:100%;margin-top:12px;'>Close</button>
       </div>
     </div>
     <script>
@@ -1238,6 +1522,116 @@ def index():
       await refreshPills();
     }catch(e){
       console.error(e);
+    }
+  }
+  
+  // Setup modal functions
+  function showSetupModal(){
+    // Load existing console data if any
+    fetch('/get_console_metadata')
+      .then(r => r.json())
+      .then(data => {
+        const consoles = data.consoles || {};
+        for(let i = 1; i <= 3; i++){
+          const c = consoles[i] || {};
+          document.getElementById('console' + i + '_serial').value = c.serial || '';
+          document.getElementById('console' + i + '_scope').value = c.scope_id || '';
+        }
+      })
+      .catch(e => console.error(e));
+    
+    document.getElementById('setupModal').classList.add('show');
+  }
+  
+  function closeSetupModal(){
+    document.getElementById('setupModal').classList.remove('show');
+  }
+  
+  async function saveConsoleMetadata(){
+    const consoles = {
+      '1': {
+        serial: document.getElementById('console1_serial').value,
+        scope_id: document.getElementById('console1_scope').value
+      },
+      '2': {
+        serial: document.getElementById('console2_serial').value,
+        scope_id: document.getElementById('console2_scope').value
+      },
+      '3': {
+        serial: document.getElementById('console3_serial').value,
+        scope_id: document.getElementById('console3_scope').value
+      }
+    };
+    
+    try{
+      const r = await fetch('/save_console_metadata', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({consoles: consoles})
+      });
+      const result = await r.json();
+      if(result.ok){
+        alert('Console metadata saved successfully! You can now start the test.');
+        closeSetupModal();
+      }else{
+        alert('Error saving metadata: ' + (result.error || 'Unknown error'));
+      }
+    }catch(e){
+      alert('Error: ' + e);
+      console.error(e);
+    }
+  }
+  
+  // Report modal functions
+  function showReport(){
+    document.getElementById('reportModal').classList.add('show');
+    document.getElementById('reportContent').textContent = 'Loading report...';
+    
+    fetch('/generate_report')
+      .then(r => r.json())
+      .then(data => {
+        if(data.ok){
+          document.getElementById('reportContent').textContent = data.report_text;
+        }else{
+          document.getElementById('reportContent').textContent = 'Error generating report: ' + (data.error || 'Unknown error');
+        }
+      })
+      .catch(e => {
+        document.getElementById('reportContent').textContent = 'Error: ' + e;
+        console.error(e);
+      });
+  }
+  
+  function closeReportModal(){
+    document.getElementById('reportModal').classList.remove('show');
+  }
+  
+  async function stopAndReport(){
+    try{
+      const r = await fetch('/stop_and_report', {method: 'POST'});
+      const data = await r.json();
+      if(data.ok){
+        // Show the report in the modal
+        document.getElementById('reportModal').classList.add('show');
+        document.getElementById('reportContent').textContent = data.report_text;
+      }else{
+        alert('Error generating report: ' + (data.error || 'Unknown error'));
+      }
+    }catch(e){
+      alert('Error: ' + e);
+      console.error(e);
+    }
+  }
+  
+  // Close modals when clicking outside
+  window.onclick = function(event){
+    const setupModal = document.getElementById('setupModal');
+    const reportModal = document.getElementById('reportModal');
+    if(event.target == setupModal){
+      closeSetupModal();
+    }
+    if(event.target == reportModal){
+      closeReportModal();
     }
   }
 
@@ -1367,14 +1761,32 @@ def _annotated_grid_from_frame(bgr):
         try:
             tile_idx0 = idx - 1
             prev = mon.tile_last[tile_idx0]
-            if det == "INTERFACE" and prev != "INTERFACE":
-                mon.tile_counts[tile_idx0] += 1
-                # Map tile index -> VIDEO number (top row: 1,3,5; bottom row: 2,4,6)
-                TILE_TO_VIDEO = [1, 3, 5, 2, 4, 6]
-                video_num = TILE_TO_VIDEO[tile_idx0]
-                _csv_append("tile_connected", video_num, mon.tile_counts[tile_idx0], int(db), int(di), mon.cycles)
+            # Map tile index -> VIDEO number (top row: 1,3,5; bottom row: 2,4,6)
+            TILE_TO_VIDEO = [1, 3, 5, 2, 4, 6]
+            video_num = TILE_TO_VIDEO[tile_idx0]
+            
+            # Track all state changes (not just to INTERFACE)
+            if det != prev and prev != "UNKNOWN":
+                # Map detection states to friendly names
+                state_name = "Scope Connected" if det == "INTERFACE" else \
+                            "Scope Disconnected" if det == "BARS" else \
+                            "No Signal" if det == "NO_SIGNAL" else "Other"
+                
+                # Update tallies
+                if det == "INTERFACE":
+                    mon.tile_counts[tile_idx0] += 1
+                    mon.state_tallies[video_num]["connected"] += 1
+                elif det == "BARS":
+                    mon.state_tallies[video_num]["disconnected"] += 1
+                elif det == "NO_SIGNAL":
+                    mon.state_tallies[video_num]["no_signal"] += 1
+                
+                # Log to CSV
+                _csv_append_state_change(video_num, state_name, int(db), int(di), mon.tile_counts[tile_idx0])
+            
             mon.tile_last[tile_idx0] = det
-        except Exception:
+        except Exception as e:
+            print(f"Error in tile transition tracking: {e}")
             pass
         if det == "INTERFACE":
             color, text = C_OK, "Scope Connected"
@@ -1938,6 +2350,33 @@ def start_get():
     print("GET /start called (no body); starting with current settings")
     return _begin_with_cfg({})
 
+@app.post("/save_console_metadata")
+def save_console_metadata():
+    """Save console serial numbers and scope IDs before starting test."""
+    try:
+        data = request.get_json(silent=True) or {}
+        consoles = data.get("consoles", {})
+        
+        with mon.lock:
+            # Validate and save console data
+            for console_num in [1, 2, 3]:
+                console_key = str(console_num)
+                if console_key in consoles:
+                    mon.consoles[console_num] = {
+                        "serial": consoles[console_key].get("serial", ""),
+                        "scope_id": consoles[console_key].get("scope_id", "")
+                    }
+        
+        return jsonify(ok=True, consoles=mon.consoles)
+    except Exception as e:
+        return jsonify(error=str(e)), 400
+
+@app.get("/get_console_metadata")
+def get_console_metadata():
+    """Get current console metadata."""
+    with mon.lock:
+        return jsonify(consoles=mon.consoles)
+
 @app.post("/stop")
 def stop():
     with mon.lock:
@@ -1948,6 +2387,40 @@ def stop():
         # Give the loop time to exit and release the device
         worker.join(timeout=2.0)
     return jsonify(ok=True)
+
+@app.post("/stop_and_report")
+def stop_and_report():
+    """Stop the test and generate a comprehensive report."""
+    # First stop the test
+    with mon.lock:
+        mon.running = False
+        mon.status = "stopped"
+    
+    worker = getattr(mon, "worker", None)
+    if worker is not None and worker.is_alive():
+        worker.join(timeout=2.0)
+    
+    # Generate report
+    try:
+        report = generate_test_report()
+        report_text = format_report_text(report)
+        
+        # Print to console
+        print("\n" + report_text + "\n")
+        
+        return jsonify(ok=True, report=report, report_text=report_text)
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 500
+
+@app.get("/generate_report")
+def get_report():
+    """Generate report without stopping (for live viewing)."""
+    try:
+        report = generate_test_report()
+        report_text = format_report_text(report)
+        return jsonify(ok=True, report=report, report_text=report_text)
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 500
 
 @app.post("/clear")
 def clear():
