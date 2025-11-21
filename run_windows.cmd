@@ -53,31 +53,24 @@ if errorlevel 1 (
     echo WARNING: Failed to install dependencies with --user flag. Trying without...
     python -m pip install flask opencv-python pillow imagehash numpy >nul 2>&1
     if errorlevel 1 (
-        echo WARNING: Failed to install dependencies. Checking if they're already available...
-        python -c "import flask, cv2, PIL, imagehash, numpy" >nul 2>&1
-        if errorlevel 1 (
-            echo ERROR: Required dependencies are not installed and installation failed.
-            echo Please install manually: pip install flask opencv-python pillow imagehash numpy
-            echo Or run this script with administrator privileges.
-            pause
-            exit /b 1
-        ) else (
-            echo Dependencies appear to be available. Continuing...
-        )
+        echo WARNING: Failed to install dependencies. Assuming they may already be available...
+        echo Continuing - Python will report any missing imports when the app starts.
+    ) else (
+        echo Dependencies installed successfully.
     )
+) else (
+    echo Dependencies installed successfully.
 )
 
-REM Verify dependencies are available before running
-echo [4/6] Verifying dependencies...
-python -c "import flask, cv2, PIL, imagehash, numpy" >nul 2>&1
+REM Verify Python is working (skip strict dependency check - let Python report errors)
+echo [4/6] Verifying Python environment...
+python --version >nul 2>&1
 if errorlevel 1 (
-    echo ERROR: Required dependencies are missing. Please install manually:
-    echo   pip install flask opencv-python pillow imagehash numpy
-    echo Or run this script with administrator privileges.
+    echo ERROR: Python is not available or not in PATH.
     pause
     exit /b 1
 )
-echo Dependencies verified.
+echo Python environment ready.
 
 REM Run the app
 echo [5/6] Starting Boot Cycle Logger on http://localhost:5055 ...
