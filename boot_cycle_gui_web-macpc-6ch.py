@@ -472,6 +472,7 @@ class Monitor:
         self.int_ref_paths = discover_int_refs()
         # int_ref2 removed/not used
         self.csv_path  = CSV_PATH
+        self.test_folder_path = None  # Will be set when test starts - contains CSV, XLSX, and screenshots
 
         # Equipment metadata: 3 consoles, each mapped to 2 video channels
         # Console 1: Videos 1&2, Console 2: Videos 3&4, Console 3: Videos 5&6
@@ -507,6 +508,19 @@ class Monitor:
         self.tile_partial_cycles = [0] * GRID_FEEDS  # count of partial cycles: NO_SIGNAL → BARS → NO_SIGNAL
         self.tile_state_history = [[] for _ in range(GRID_FEEDS)]  # track state progression for each channel
         self.tile_in_partial_cycle = [False] * GRID_FEEDS  # track if we're in a potential partial cycle (entered BARS from NO_SIGNAL)
+        
+        # Tile stabilization tracking (for equal evaluation across all 6 channels)
+        self.tile_raw_last = ["UNKNOWN"] * GRID_FEEDS
+        self.tile_raw_stable = [0] * GRID_FEEDS
+        self.tile_last_change_ts = [0.0] * GRID_FEEDS
+        
+        # Periodic CSV snapshot tracking
+        self.last_snapshot_ts = 0.0
+        self.snapshot_interval = 1.0  # seconds between snapshots (reduced for high-frequency logging)
+        
+        # Anomaly tracking for "Other" state detections
+        self.other_detection_count = 0  # Total count of "Other" state detections (anomalies)
+        self.other_detections_by_channel = [0] * GRID_FEEDS  # Per-channel "Other" detection counts
 
         # stabilization
         self._last = "UNKNOWN"
@@ -553,8 +567,16 @@ class Monitor:
         self._raw_last = "UNKNOWN"
         self._raw_stable = 0
         self.last_seen = {"BARS": None, "INTERFACE": None, "OTHER": None, "NO_SIGNAL": None}
-        # new timestamped CSV on each clear
-        self.csv_path = os.path.join(LOG_ROOT, f"boot_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
+        # Create timestamped folder for this test run
+        timestamp_str = datetime.now().strftime('%Y%m%d_%H%M%S')
+        self.test_folder_path = os.path.join(LOG_ROOT, f"test_{timestamp_str}")
+        os.makedirs(self.test_folder_path, exist_ok=True)
+        # Create captures subfolder for screenshots
+        captures_folder = os.path.join(self.test_folder_path, "captures")
+        os.makedirs(captures_folder, exist_ok=True)
+        # new timestamped CSV on each clear - inside the test folder
+        self.csv_path = os.path.join(self.test_folder_path, f"boot_log_{timestamp_str}.csv")
+        print(f"[reset_counts_and_roll_csv] Created test folder: {self.test_folder_path}")
         self.await_connect = True
         # Reset per-tile counters
         self.tile_last = ["UNKNOWN"] * GRID_FEEDS
@@ -566,6 +588,16 @@ class Monitor:
         self.tile_partial_cycles = [0] * GRID_FEEDS  # Reset partial cycle counts
         self.tile_in_partial_cycle = [False] * GRID_FEEDS
         self.tile_state_history = [[] for _ in range(GRID_FEEDS)]
+        # Reset tile stabilization tracking
+        self.tile_raw_last = ["UNKNOWN"] * GRID_FEEDS
+        self.tile_raw_stable = [0] * GRID_FEEDS
+        self.tile_last_change_ts = [0.0] * GRID_FEEDS
+        # Reset snapshot tracking
+        self.last_snapshot_ts = 0.0
+        
+        # Reset anomaly tracking
+        self.other_detection_count = 0
+        self.other_detections_by_channel = [0] * GRID_FEEDS
 
     def reset_tallies(self):
         """Zero counters and last-seen timestamps without rolling the CSV file."""
@@ -1044,14 +1076,56 @@ def decide(
         # Very dark ROI (essentially black) = No Signal, even if full frame isn't perfectly flat
         is_no_signal = True
     
+    # Use a more lenient threshold for BARS to prevent misclassification as OTHER
+    # This ensures Scope Disconnected is always detected correctly
+    bars_gate_lenient = bars_gate + 3  # Add 3 to the threshold for more lenient matching
+    bars_gate_very_lenient = bars_gate + 8  # Very lenient for color bar patterns
+    
+    # Check for color bar pattern characteristics:
+    # - Medium brightness (not white, not black)
+    # - Low white fraction (not the connected interface)
+    # - Some structure (not completely flat)
+    # - Reasonable pHash distance to BARS (even if not perfect match)
+    is_color_bar_like = (
+        not is_no_signal and
+        not strong_white and
+        not gray_ok and
+        roi_mean > 50.0 and roi_mean < 220.0 and  # Medium brightness range
+        white_frac_gray < 0.1 and  # Not white
+        white_frac_rgb < 0.1 and
+        std_lum > 10.0  # Has some structure (not flat)
+    )
+    
     if is_no_signal:
         det = "NO_SIGNAL"
+    elif db < bars_gate_lenient and not (phash_ok and (strong_white or gray_ok)):
+        # BARS: pHash matches disconnected reference, but NOT connected interface
+        # Check BARS BEFORE INTERFACE to prevent misclassification
+        det = "BARS"
+    elif is_color_bar_like and db < bars_gate_very_lenient:
+        # Color bar pattern detected: medium brightness, not white, reasonable BARS match
+        # This catches color bar test patterns that should be "Scope Disconnected"
+        det = "BARS"
     elif phash_ok and (strong_white or gray_ok):
         det = "INTERFACE"
     elif strong_white:
         det = "INTERFACE"
     elif db < bars_gate:
+        # Fallback BARS check (original threshold)
         det = "BARS"
+    elif is_color_bar_like:
+        # Last resort: if it looks like a color bar pattern, classify as BARS
+        # This prevents color bars from ever being classified as OTHER
+        # Color bars are a form of "Scope Disconnected" test pattern
+        det = "BARS"
+    elif not is_no_signal and not strong_white and not gray_ok and roi_mean > 50.0 and roi_mean < 220.0:
+        # Additional safety: if it's medium brightness, not white, not black, and not NO_SIGNAL,
+        # and we haven't matched anything else, prefer BARS over OTHER
+        # This catches edge cases where pHash might not match perfectly but pattern suggests BARS
+        if db < (bars_gate + 15):  # Very lenient threshold
+            det = "BARS"
+        else:
+            det = "OTHER"
     else:
         det = "OTHER"
 
@@ -1817,6 +1891,7 @@ def _generate_and_append_report():
         report_lines.append(f"  Complete Cycles: {mon.tile_complete_cycles[tile_idx]}")
         report_lines.append(f"  Total Transitions to Connected: {mon.tile_counts[tile_idx]}")
         report_lines.append(f"  Total Transitions to Disconnected: {mon.tile_disconnected_counts[tile_idx]}")
+        report_lines.append(f"  ANOMALIES (Other State Detections): {mon.other_detections_by_channel[tile_idx]}")
         
         # Parse CSV to get detailed statistics about Scope Disconnected states
         disconnected_data = []
@@ -1913,6 +1988,26 @@ def _generate_and_append_report():
     
     if not incomplete_found:
         report_lines.append("No incomplete cycles detected.")
+    
+    report_lines.append("")
+    report_lines.append("=" * 80)
+    report_lines.append("ANOMALY DETECTION SUMMARY")
+    report_lines.append("-" * 80)
+    report_lines.append(f"Total 'Other' State Detections (Anomalies): {mon.other_detection_count}")
+    if mon.other_detection_count > 0:
+        report_lines.append("")
+        report_lines.append("Per-Channel Anomaly Counts:")
+        for tile_idx in range(GRID_FEEDS):
+            video_num = TILE_TO_VIDEO[tile_idx]
+            count = mon.other_detections_by_channel[tile_idx]
+            if count > 0:
+                console_serial, scope_id = _get_equipment_for_video(video_num)
+                report_lines.append(f"  Video {video_num} (Console: {console_serial}, Scope: {scope_id}): {count} anomalies")
+        report_lines.append("")
+        report_lines.append("NOTE: All 'Other' state detections are considered anomalies.")
+        report_lines.append("      Screenshots have been saved in the 'captures' folder with 'ANOMALY_' prefix.")
+    else:
+        report_lines.append("No anomalies detected - all states were as expected (No Signal, Scope Disconnected, Scope Connected).")
     
     report_lines.append("")
     report_lines.append("=" * 80)
@@ -3083,6 +3178,8 @@ def _annotated_grid_from_frame(bgr):
         dmean      = mon.dark_mean
         dstd       = mon.dark_std
         margin     = mon.margin
+        st         = mon.stable_frames
+        hold_ms    = mon.hold_ms
 
     if bars_h_roi is None or not int_h_list:
         try:
@@ -3123,108 +3220,149 @@ def _annotated_grid_from_frame(bgr):
         except Exception:
             discnt_val = 0
         tiles_out.append({"det": det, "db": int(db), "di": int(di), "cnt": int(mon.tile_counts[idx-1]), "discnt": discnt_val})
-        # --- Per-tile transition tracking and CSV logging ---
+        # --- Per-tile transition tracking and CSV logging with stabilization ---
         try:
             tile_idx0 = idx - 1
             prev = mon.tile_last[tile_idx0]
             TILE_TO_VIDEO = [1, 3, 5, 2, 4, 6]
             video_num = TILE_TO_VIDEO[tile_idx0]
             
-            # Track state changes
+            # Add stabilization tracking per tile (similar to main loop)
+            # Track raw detection stability
+            if det == mon.tile_raw_last[tile_idx0]:
+                mon.tile_raw_stable[tile_idx0] += 1
+            else:
+                mon.tile_raw_last[tile_idx0] = det
+                mon.tile_raw_stable[tile_idx0] = 1
+            
+            # Track state changes only after stabilization (same logic as main loop)
             if det != prev:
-                # Record state history
-                mon.tile_state_history[tile_idx0].append({
-                    "state": det,
-                    "timestamp": time.time()
-                })
-                
-                # Calculate elapsed time from test start
-                elapsed_from_test_start = None
-                if mon.test_start_time:
-                    elapsed_from_test_start = (time.time() - mon.test_start_time.timestamp())
-                
-                # Track timing for Disconnected → Connected transitions
+                # Apply same hysteresis logic as main loop
+                det_ok = False
                 if det == "BARS":
-                    # Mark start of Scope Disconnected period
-                    # Don't increment count yet - wait to see if next state is NO_SIGNAL
-                    mon.tile_disconnected_start[tile_idx0] = time.time()
-                    
-                    # Check if we entered BARS from NO_SIGNAL (potential partial cycle)
-                    if prev == "NO_SIGNAL":
-                        mon.tile_in_partial_cycle[tile_idx0] = True
-                    
-                    # Log Scope Disconnected with elapsed time and current cycle number
-                    _csv_append(video_num, det, 
-                               elapsed_secs=elapsed_from_test_start,
-                               cycle_num=mon.tile_complete_cycles[tile_idx0],
-                               partial_cycle_num=None,
-                               bars_dist=int(db), int_dist=int(di))
-                    
+                    det_ok = (db < (thr + margin))
                 elif det == "INTERFACE":
-                    # Scope Connected - increment cycle number FIRST
-                    mon.tile_complete_cycles[tile_idx0] += 1
-                    
-                    # If we were in a partial cycle but went to INTERFACE instead of NO_SIGNAL, cancel the partial cycle
-                    if mon.tile_in_partial_cycle[tile_idx0]:
-                        mon.tile_in_partial_cycle[tile_idx0] = False
-                    
-                    # Calculate elapsed time if coming from Disconnected (for reconnection timing)
-                    reconnection_elapsed = None
-                    if mon.tile_disconnected_start[tile_idx0] is not None:
-                        reconnection_elapsed = time.time() - mon.tile_disconnected_start[tile_idx0]
-                        mon.tile_cycle_times[tile_idx0].append(reconnection_elapsed)
-                        mon.tile_disconnected_start[tile_idx0] = None
-                    
-                    mon.tile_counts[tile_idx0] += 1
-                    
-                    # Log Scope Connected with elapsed time from test start and cycle number
-                    _csv_append(video_num, det, 
-                               elapsed_secs=elapsed_from_test_start,
-                               cycle_num=mon.tile_complete_cycles[tile_idx0],
-                               partial_cycle_num=None,
-                               bars_dist=int(db), int_dist=int(di))
-                    
-                elif det == "NO_SIGNAL":
-                    # Check for partial cycle completion: NO_SIGNAL → BARS → NO_SIGNAL
-                    partial_cycle_count = None
-                    if prev == "BARS" and mon.tile_in_partial_cycle[tile_idx0]:
-                        # Complete partial cycle detected: NO_SIGNAL → BARS → NO_SIGNAL
-                        mon.tile_partial_cycles[tile_idx0] += 1
-                        partial_cycle_count = mon.tile_partial_cycles[tile_idx0]
-                        mon.tile_in_partial_cycle[tile_idx0] = False
-                    
-                    # Only increment disconnected count if we're transitioning FROM BARS to NO_SIGNAL
-                    # This means the scope was disconnected and went to no signal (complete disconnect cycle)
-                    # If it went BARS → INTERFACE, that's a normal cycle, not a disconnect
-                    if prev == "BARS":
-                        mon.tile_disconnected_counts[tile_idx0] += 1
-                        # Clear the disconnected start time since we've completed the disconnect cycle
-                        if mon.tile_disconnected_start[tile_idx0] is not None:
-                            mon.tile_disconnected_start[tile_idx0] = None
-                    
-                    # Log NO_SIGNAL - no elapsed_secs, but include partial_cycle_count if this completes a partial cycle
-                    _csv_append(video_num, det, 
-                               elapsed_secs=None,  # Don't log elapsed_secs for NO_SIGNAL
-                               cycle_num=None,
-                               partial_cycle_num=partial_cycle_count,
-                               bars_dist=int(db), int_dist=int(di))
-                    
-                else:  # OTHER
-                    # If we were in a partial cycle but went to OTHER, cancel the partial cycle
-                    if mon.tile_in_partial_cycle[tile_idx0]:
-                        mon.tile_in_partial_cycle[tile_idx0] = False
-                    
-                    # Don't log any values (elapsed_secs, cycle_num, partial_cycle_num) for OTHER state
-                    _csv_append(video_num, det, 
-                               elapsed_secs=None,  # No elapsed_secs for OTHER
-                               cycle_num=None,  # No cycle_num for OTHER
-                               partial_cycle_num=None,  # No partial_cycle_num for OTHER
-                               bars_dist=int(db), int_dist=int(di))
+                    det_ok = (di < (thr + margin)) or bright_ok
+                else:
+                    det_ok = True  # OTHER/NO_SIGNAL has no phash gate
                 
-                mon.tile_last[tile_idx0] = det
+                now_ts = time.time()
+                long_enough = (now_ts - mon.tile_last_change_ts[tile_idx0]) * 1000.0 >= hold_ms
+                
+                # Only log if stable enough AND passes gate AND enough time has passed
+                if (mon.tile_raw_stable[tile_idx0] >= st and det_ok and long_enough):
+                    # Record state history
+                    mon.tile_state_history[tile_idx0].append({
+                        "state": det,
+                        "timestamp": now_ts
+                    })
+                    
+                    # Update tile_last to the new stable state
+                    mon.tile_last[tile_idx0] = det
+                    mon.tile_last_change_ts[tile_idx0] = now_ts
+                    
+                    # Calculate elapsed time from test start
+                    elapsed_from_test_start = None
+                    if mon.test_start_time:
+                        elapsed_from_test_start = (now_ts - mon.test_start_time.timestamp())
+                    
+                    # Track timing for Disconnected → Connected transitions
+                    if det == "BARS":
+                        # Mark start of Scope Disconnected period
+                        mon.tile_disconnected_start[tile_idx0] = now_ts
+                        
+                        # Check if we entered BARS from NO_SIGNAL (potential partial cycle)
+                        if prev == "NO_SIGNAL":
+                            mon.tile_in_partial_cycle[tile_idx0] = True
+                        
+                        # Log Scope Disconnected with elapsed time and current cycle number
+                        _csv_append(video_num, det, 
+                                   elapsed_secs=elapsed_from_test_start,
+                                   cycle_num=mon.tile_complete_cycles[tile_idx0],
+                                   partial_cycle_num=None,
+                                   bars_dist=int(db), int_dist=int(di))
+                        
+                    elif det == "INTERFACE":
+                        # Scope Connected - increment cycle number FIRST
+                        mon.tile_complete_cycles[tile_idx0] += 1
+                        
+                        # If we were in a partial cycle but went to INTERFACE instead of NO_SIGNAL, cancel the partial cycle
+                        if mon.tile_in_partial_cycle[tile_idx0]:
+                            mon.tile_in_partial_cycle[tile_idx0] = False
+                        
+                        # Calculate elapsed time if coming from Disconnected (for reconnection timing)
+                        reconnection_elapsed = None
+                        if mon.tile_disconnected_start[tile_idx0] is not None:
+                            reconnection_elapsed = now_ts - mon.tile_disconnected_start[tile_idx0]
+                            mon.tile_cycle_times[tile_idx0].append(reconnection_elapsed)
+                            mon.tile_disconnected_start[tile_idx0] = None
+                        
+                        mon.tile_counts[tile_idx0] += 1
+                        
+                        # Log Scope Connected with elapsed time from test start and cycle number
+                        _csv_append(video_num, det, 
+                                   elapsed_secs=elapsed_from_test_start,
+                                   cycle_num=mon.tile_complete_cycles[tile_idx0],
+                                   partial_cycle_num=None,
+                                   bars_dist=int(db), int_dist=int(di))
+                        
+                    elif det == "NO_SIGNAL":
+                        # Check for partial cycle completion: NO_SIGNAL → BARS → NO_SIGNAL
+                        partial_cycle_count = None
+                        if prev == "BARS" and mon.tile_in_partial_cycle[tile_idx0]:
+                            # Complete partial cycle detected: NO_SIGNAL → BARS → NO_SIGNAL
+                            mon.tile_partial_cycles[tile_idx0] += 1
+                            partial_cycle_count = mon.tile_partial_cycles[tile_idx0]
+                            mon.tile_in_partial_cycle[tile_idx0] = False
+                        
+                        # Only increment disconnected count if we're transitioning FROM BARS to NO_SIGNAL
+                        if prev == "BARS":
+                            mon.tile_disconnected_counts[tile_idx0] += 1
+                            if mon.tile_disconnected_start[tile_idx0] is not None:
+                                mon.tile_disconnected_start[tile_idx0] = None
+                        
+                        # Log No Signal
+                        _csv_append(video_num, det,
+                                   elapsed_secs=None,  # NO_SIGNAL never has elapsed_secs
+                                   cycle_num=mon.tile_complete_cycles[tile_idx0],
+                                   partial_cycle_num=partial_cycle_count,
+                                   bars_dist=int(db), int_dist=int(di))
+                        
+                    else:  # OTHER (ANOMALY)
+                        # If we were in a partial cycle but went to OTHER, cancel the partial cycle
+                        if mon.tile_in_partial_cycle[tile_idx0]:
+                            mon.tile_in_partial_cycle[tile_idx0] = False
+                        
+                        # Track "Other" as an anomaly
+                        mon.other_detection_count += 1
+                        mon.other_detections_by_channel[tile_idx0] += 1
+                        
+                        # Capture screenshot for "Other" state detection (anomaly)
+                        try:
+                            if mon.test_folder_path:
+                                captures_folder = os.path.join(mon.test_folder_path, "captures")
+                                os.makedirs(captures_folder, exist_ok=True)
+                                timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]  # milliseconds
+                                # Save both the individual tile and the full annotated frame
+                                tile_path = os.path.join(captures_folder, f"ANOMALY_vid{video_num}_tile_{timestamp_str}.png")
+                                full_path = os.path.join(captures_folder, f"ANOMALY_vid{video_num}_full_{timestamp_str}.png")
+                                cv2.imwrite(tile_path, tile)
+                                cv2.imwrite(full_path, out)
+                                print(f"[annotate_grid] ANOMALY detected - Captured 'Other' state screenshots for Video {video_num}: {tile_path}, {full_path}")
+                        except Exception as e:
+                            print(f"[annotate_grid] Error capturing 'Other' screenshot: {e}")
+                        
+                        # Log Other state (marked as anomaly in event_type)
+                        _csv_append(video_num, det,
+                                   elapsed_secs=elapsed_from_test_start,
+                                   cycle_num=mon.tile_complete_cycles[tile_idx0],
+                                   partial_cycle_num=None,
+                                   bars_dist=int(db), int_dist=int(di),
+                                   event_type="anomaly")
         except Exception as e:
-            print(f"[Tile tracking] Error: {e}")
-            pass
+            print(f"[annotate_grid] Error processing tile {idx}: {e}")
+            import traceback
+            traceback.print_exc()
         if det == "INTERFACE":
             color, text = C_OK, "Scope Connected"
         elif det == "BARS":
@@ -3289,6 +3427,34 @@ def _annotated_grid_from_frame(bgr):
             mon.last_grid = {"ts": time.time(), "tiles": tiles_out}
     except Exception:
         pass
+    
+    # Periodic CSV snapshots to ensure continuous logging (even without state changes)
+    # This ensures we get enough records for long-running tests
+    try:
+        now_ts = time.time()
+        if mon.detection_active and (now_ts - mon.last_snapshot_ts) >= mon.snapshot_interval:
+            mon.last_snapshot_ts = now_ts
+            TILE_TO_VIDEO = [1, 3, 5, 2, 4, 6]
+            for tile_idx0, video_num in enumerate(TILE_TO_VIDEO):
+                current_state = mon.tile_last[tile_idx0]
+                if current_state != "UNKNOWN":
+                    elapsed_from_test_start = None
+                    if mon.test_start_time:
+                        elapsed_from_test_start = (now_ts - mon.test_start_time.timestamp())
+                    _csv_append(
+                        video=video_num,
+                        state=current_state,
+                        elapsed_secs=elapsed_from_test_start if current_state != "NO_SIGNAL" else None,
+                        cycle_num=mon.tile_complete_cycles[tile_idx0] if current_state in ["INTERFACE", "BARS", "OTHER"] else None,
+                        partial_cycle_num=mon.tile_partial_cycles[tile_idx0] if current_state == "NO_SIGNAL" else None,
+                        bars_dist=None,
+                        int_dist=None,
+                        event_type="status_snapshot"
+                    )
+    except Exception as e:
+        print(f"[annotate_grid] Error in periodic snapshot: {e}")
+        import traceback
+        traceback.print_exc()
 
     return out
 
