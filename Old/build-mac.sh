@@ -38,21 +38,9 @@ fi
 
 # IMPORTANT: On mac/Linux, --add-data uses colon (:) as the separator
 ADD_DATA=(
-  --add-data "$ROOT_DIR/Scope-Disconnected.png:."
-  --add-data "$ROOT_DIR/Scope-Connected-SidewinderCCU.png:."
-  --add-data "$ROOT_DIR/Scope-Connected-OtherCCU.png:."
+  --add-data "$ROOT_DIR/art:art"
+  --add-data "$ROOT_DIR/templates:templates"
 )
-
-# Optionally bundle common resource folders if they exist
-if [[ -d "$ROOT_DIR/templates" ]]; then
-  ADD_DATA+=(--add-data "$ROOT_DIR/templates:templates")
-fi
-if [[ -d "$ROOT_DIR/static" ]]; then
-  ADD_DATA+=(--add-data "$ROOT_DIR/static:static")
-fi
-if [[ -d "$ROOT_DIR/assets" ]]; then
-  ADD_DATA+=(--add-data "$ROOT_DIR/assets:assets")
-fi
 
 # Build a single-file console binary (nice for seeing logs)
 echo "🏗️  Building single-file CLI binary…"
@@ -60,7 +48,7 @@ echo "🏗️  Building single-file CLI binary…"
   "${ICON_FLAG[@]}" \
   "${ADD_DATA[@]}" \
   --name BootCycleLogger-mac \
-  boot_cycle_gui_web-macpc.py
+  boot_cycle_gui_web-macpc-6ch.py
 
 # (Optional) Build a .app bundle (windowless) — logs will not show in a terminal
 # Uncomment this block if you also want a macOS .app:
@@ -69,7 +57,7 @@ echo "🏗️  Building single-file CLI binary…"
 #   "${ICON_FLAG[@]}" \
 #   "${ADD_DATA[@]}" \
 #   --name BootCycleLogger \
-#   boot_cycle_gui_web-macpc.py
+#   boot_cycle_gui_web-macpc-6ch.py
 
 # Summary
 if [[ -f "dist/BootCycleLogger-mac" ]]; then

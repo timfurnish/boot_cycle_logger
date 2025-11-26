@@ -1,0 +1,41 @@
+==============================================
+FLICKER PC - CONFIRMED WORKING SETTINGS
+==============================================
+
+Based on diagnostic output from diagnose_flicker.bat
+
+OBS VIRTUAL CAMERA SETTINGS:
+  Source: 1
+  Backend: MSMF
+  Resolution: 1080p
+  FOURCC: auto
+
+EXPLANATION:
+- Source 0 = Laptop camera (640x480 @ 30fps)
+- Source 1 = OBS Virtual Camera (1920x1080 @ 30fps) ← USE THIS
+- Source 2 = USB Video device (640x480)
+
+DSHOW BACKEND DOESN'T WORK:
+All DSHOW sources report 0fps, indicating the backend
+is not functioning properly with this OpenCV build.
+
+Use MSMF backend exclusively on this PC.
+
+TESTED: 2025-10-17
+OBS VERSION: 32.0.1
+PYTHON: 3.12.10
+OPENCV: 4.12.0
+
+NOTES:
+- No flickering detected in diagnostic
+- All sources reported as STABLE
+- OpenCV name-based detection broken (normal for some builds)
+- MSMF backend works, DSHOW does not
+
+TO USE THESE SETTINGS:
+1. Open Boot Cycle Logger
+2. Set Source = 1
+3. Set Backend = MSMF
+4. Click "Connect to Camera"
+5. Verify you see OBS feed (not laptop camera)
+

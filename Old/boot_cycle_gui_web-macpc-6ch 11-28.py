@@ -37,30 +37,7 @@ Build (macOS):
     boot_cycle_gui_web-macpc-6ch.py
 """
 
-import os, sys, threading, time, csv, platform, webbrowser, subprocess, socket
-from io import StringIO
-from datetime import datetime
-
-# Global log buffer to capture all print statements
-_log_buffer = []
-_log_lock = threading.Lock()
-
-# Save the original print function before we replace it
-_print_original = print
-
-def _log_print(*args, **kwargs):
-    """Custom print function that logs to both console and buffer."""
-    # Print to console using the original print function (not the replaced one)
-    _print_original(*args, **kwargs)
-    # Also capture to buffer
-    with _log_lock:
-        # Format the message with timestamp
-        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
-        message = ' '.join(str(arg) for arg in args)
-        _log_buffer.append(f"[{timestamp}] {message}")
-
-# Replace built-in print with our logging version
-print = _log_print
+import os, sys, threading, time, csv, platform, webbrowser, subprocess
 
 # Excel export support (optional dependency)
 try:
@@ -139,18 +116,6 @@ import cv2, numpy as np
 from PIL import Image
 import imagehash as ih
 import subprocess
-
-# Fix Windows console encoding for Unicode characters (✓, ✗, etc.)
-if platform.system() == "Windows":
-    try:
-        # Try to set console to UTF-8 mode
-        import io
-        if sys.stdout.encoding != 'utf-8':
-            sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
-        if sys.stderr.encoding != 'utf-8':
-            sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
-    except Exception:
-        pass  # If this fails, Unicode will be replaced with '?' but app will still run
 
 # Video source & capture options (sane defaults, then OS tweaks)
 BACKEND    = "auto"     # auto|MSMF|DSHOW|AVFOUNDATION|V4L2
@@ -507,7 +472,6 @@ class Monitor:
         self.int_ref_paths = discover_int_refs()
         # int_ref2 removed/not used
         self.csv_path  = CSV_PATH
-        self.test_folder_path = None  # Will be set when test starts - contains CSV, XLSX, and screenshots
 
         # Equipment metadata: 3 consoles, each mapped to 2 video channels
         # Console 1: Videos 1&2, Console 2: Videos 3&4, Console 3: Videos 5&6
@@ -543,22 +507,6 @@ class Monitor:
         self.tile_partial_cycles = [0] * GRID_FEEDS  # count of partial cycles: NO_SIGNAL → BARS → NO_SIGNAL
         self.tile_state_history = [[] for _ in range(GRID_FEEDS)]  # track state progression for each channel
         self.tile_in_partial_cycle = [False] * GRID_FEEDS  # track if we're in a potential partial cycle (entered BARS from NO_SIGNAL)
-        
-        # Tile stabilization tracking (for equal evaluation across all 6 channels)
-        self.tile_raw_last = ["UNKNOWN"] * GRID_FEEDS
-        self.tile_raw_stable = [0] * GRID_FEEDS
-        self.tile_last_change_ts = [0.0] * GRID_FEEDS
-        
-        # Periodic CSV snapshot tracking
-        self.last_snapshot_ts = 0.0
-        self.snapshot_interval = 1.0  # seconds between snapshots (reduced for high-frequency logging)
-        
-        # Anomaly tracking for "Other" state detections
-        self.other_detection_count = 0  # Total count of "Other" state detections (anomalies)
-        self.other_detections_by_channel = [0] * GRID_FEEDS  # Per-channel "Other" detection counts
-        
-        # Track last logged state per channel to avoid redundant consecutive logs
-        self.tile_last_logged_state = ["UNKNOWN"] * GRID_FEEDS
 
         # stabilization
         self._last = "UNKNOWN"
@@ -574,7 +522,6 @@ class Monitor:
         self.last_crop  = None
         self.last_metrics = {"db": None, "di": None, "mean": None, "std": None}
         self.last_grid = None  # cached per-frame grid detections for UI consistency
-        self.last_annotated = None  # last fully annotated grid frame for /thumb
 
         # cached refs for quick /thumb grid annotation
         self._bars_h_roi = None
@@ -606,72 +553,19 @@ class Monitor:
         self._raw_last = "UNKNOWN"
         self._raw_stable = 0
         self.last_seen = {"BARS": None, "INTERFACE": None, "OTHER": None, "NO_SIGNAL": None}
-        # Create timestamped folder for this test run
-        timestamp_str = datetime.now().strftime('%Y%m%d_%H%M%S')
-        
-        # Normalize LOG_ROOT for Windows (handles network drives and spaces)
-        normalized_log_root = os.path.normpath(LOG_ROOT)
-        self.test_folder_path = os.path.join(normalized_log_root, f"test_{timestamp_str}")
-        # Normalize the full path again for Windows
-        self.test_folder_path = os.path.normpath(self.test_folder_path)
-        
-        try:
-            os.makedirs(self.test_folder_path, exist_ok=True)
-            # Verify directory was actually created
-            if not os.path.exists(self.test_folder_path):
-                raise OSError(f"Directory was not created: {self.test_folder_path}")
-            # Check write permission
-            if not os.access(self.test_folder_path, os.W_OK):
-                raise PermissionError(f"No write permission to directory: {self.test_folder_path}")
-            
-            # Create captures subfolder for screenshots
-            captures_folder = os.path.join(self.test_folder_path, "captures")
-            captures_folder = os.path.normpath(captures_folder)
-            os.makedirs(captures_folder, exist_ok=True)
-            # Verify captures folder was created
-            if not os.path.exists(captures_folder):
-                raise OSError(f"Captures directory was not created: {captures_folder}")
-        except Exception as e:
-            print(f"[reset_counts_and_roll_csv] ERROR creating test folder: {e}")
-            print(f"[reset_counts_and_roll_csv] LOG_ROOT: {LOG_ROOT}")
-            print(f"[reset_counts_and_roll_csv] Normalized LOG_ROOT: {normalized_log_root}")
-            print(f"[reset_counts_and_roll_csv] Test folder path: {self.test_folder_path}")
-            print(f"[reset_counts_and_roll_csv] Directory exists: {os.path.exists(self.test_folder_path) if hasattr(self, 'test_folder_path') else 'N/A'}")
-            raise
-        
-        # new timestamped CSV on each clear - inside the test folder
-        self.csv_path = os.path.join(self.test_folder_path, f"boot_log_{timestamp_str}.csv")
-        # Normalize CSV path for Windows
-        self.csv_path = os.path.normpath(self.csv_path)
-        
-        # Set log file path in test folder
-        self.log_file_path = os.path.join(self.test_folder_path, f"boot_log_{timestamp_str}.log")
-        self.log_file_path = os.path.normpath(self.log_file_path)
-        
-        print(f"[reset_counts_and_roll_csv] Created test folder: {self.test_folder_path}")
-        print(f"[reset_counts_and_roll_csv] CSV path: {self.csv_path}")
-        print(f"[reset_counts_and_roll_csv] Log file path: {self.log_file_path}")
+        # new timestamped CSV on each clear
+        self.csv_path = os.path.join(LOG_ROOT, f"boot_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
         self.await_connect = True
-        self.test_start_time = None  # New run, test start timestamp will be set when detection begins
         # Reset per-tile counters
         self.tile_last = ["UNKNOWN"] * GRID_FEEDS
         self.tile_counts = [0] * GRID_FEEDS
         self.tile_disconnected_counts = [0] * GRID_FEEDS
         self.tile_disconnected_start = [None] * GRID_FEEDS
         self.tile_cycle_times = [[] for _ in range(GRID_FEEDS)]
-        # Reset tile stabilization tracking
-        self.tile_raw_last = ["UNKNOWN"] * GRID_FEEDS
-        self.tile_raw_stable = [0] * GRID_FEEDS
-        self.tile_last_change_ts = [0.0] * GRID_FEEDS
-        # Reset snapshot tracking
-        self.last_snapshot_ts = 0.0
-        
-        # Reset anomaly tracking
-        self.other_detection_count = 0
-        self.other_detections_by_channel = [0] * GRID_FEEDS
-        
-        # Reset last logged state tracking
-        self.tile_last_logged_state = ["UNKNOWN"] * GRID_FEEDS
+        self.tile_complete_cycles = [0] * GRID_FEEDS  # Reset complete cycle counts
+        self.tile_partial_cycles = [0] * GRID_FEEDS  # Reset partial cycle counts
+        self.tile_in_partial_cycle = [False] * GRID_FEEDS
+        self.tile_state_history = [[] for _ in range(GRID_FEEDS)]
 
     def reset_tallies(self):
         """Zero counters and last-seen timestamps without rolling the CSV file."""
@@ -693,44 +587,24 @@ class Monitor:
         self.tile_partial_cycles = [0] * GRID_FEEDS
         self.tile_in_partial_cycle = [False] * GRID_FEEDS
         self.tile_state_history = [[] for _ in range(GRID_FEEDS)]
-        self.test_start_time = None  # Reset timer reference for next run
 
 mon = Monitor()
 
 def _get_excel_path(csv_path):
-    """Get Excel file path from CSV path - same folder, same name, different extension."""
-    csv_path = os.path.normpath(csv_path)
-    base_name = os.path.splitext(csv_path)[0]  # Remove .csv extension
-    excel_path = base_name + '.xlsx'
-    return os.path.normpath(excel_path)
+    """Get Excel file path from CSV path."""
+    return csv_path.replace('.csv', '.xlsx')
 
-def _create_excel_from_csv(csv_path):
-    """Convert CSV file to Excel with formatting, filters, and conditional formatting. Called when test ends."""
+def _create_excel_file(excel_path):
+    """Create Excel file with formatted headers (frozen top row, bold)."""
     if not EXCEL_AVAILABLE:
-        print("[Excel] openpyxl not available, skipping Excel creation")
         return None
     
-    excel_path = _get_excel_path(csv_path)
-    excel_path = os.path.normpath(excel_path)  # Normalize for network drives
-    
     try:
-        from openpyxl.styles import PatternFill
-        
-        # Ensure directory exists
-        excel_dir = os.path.dirname(excel_path)
-        if excel_dir:
-            os.makedirs(excel_dir, exist_ok=True)
-            if not os.path.exists(excel_dir):
-                raise OSError(f"Directory was not created: {excel_dir}")
-            if not os.access(excel_dir, os.W_OK):
-                raise PermissionError(f"No write permission to directory: {excel_dir}")
-        
         wb = Workbook()
         ws = wb.active
         ws.title = "Boot Cycle Log"
         
-        # Column headers - order matches CSV: Timestamp, Video Channel, Console Serial, Scope ID, State,
-        # Elapsed Secs, full cycle count, partial cycle count, Other Count, Event Type, Disconnected Match Distance, Connected Match Distance
+        # Column headers
         headers = [
             "Timestamp",
             "Video Channel",
@@ -740,10 +614,9 @@ def _create_excel_from_csv(csv_path):
             "Elapsed Secs",
             "full cycle count",
             "partial cycle count",
-            "Other Count",
-            "Event Type",
             "Disconnected Match Distance",
-            "Connected Match Distance"
+            "Connected Match Distance",
+            "Event Type"
         ]
         
         # Write headers with bold formatting
@@ -760,214 +633,11 @@ def _create_excel_from_csv(csv_path):
             col_letter = get_column_letter(col_idx)
             ws.column_dimensions[col_letter].width = 20
         
-        # Read CSV and write data rows (skip summary rows and report text)
-        csv_path_norm = os.path.normpath(csv_path)
-        row_num = 2  # Start after header
-        red_fill = PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid")
-        data_rows_written = 0
-        
-        if not os.path.exists(csv_path_norm):
-            print(f"[Excel] CSV file not found: {csv_path_norm}")
-            raise FileNotFoundError(f"CSV file not found: {csv_path_norm}")
-        
-        print(f"[Excel] Reading CSV from: {csv_path_norm}")
-        with open(csv_path_norm, 'r', newline='', encoding='utf-8') as f:
-            # Read entire file content to handle report text at end
-            content = f.read()
-        
-        # Find where report starts (look for "=" * 80 pattern or "SUMMARY")
-        report_start = content.find("=" * 80)
-        if report_start < 0:
-            report_start = content.find("SUMMARY")
-        
-        if report_start >= 0:
-            # Only process CSV data, skip report text
-            content = content[:report_start]
-            print(f"[Excel] Found report text at position {report_start}, processing {len(content)} chars of CSV data")
-        
-        # Parse CSV data rows
-        from io import StringIO
-        f = StringIO(content)
-        reader = csv.DictReader(f)
-        
-        for row in reader:
-            # Skip empty rows or rows without required fields
-            if not row:
-                continue
-            
-            state = row.get('State', '').strip()
-            video_channel = row.get('Video Channel', '').strip()
-            
-            # Skip summary rows and report text
-            if state.startswith('SUMMARY') or state.startswith('='):
-                continue
-            
-            # Skip rows without required fields
-            if not video_channel or not state:
-                continue
-            
-            # Write row data with proper type conversion and error handling
-            try:
-                video_channel_val = int(video_channel) if video_channel.isdigit() else video_channel
-            except (ValueError, AttributeError):
-                video_channel_val = video_channel
-            
-            try:
-                elapsed_secs_str = row.get('Elapsed Secs', '').strip()
-                elapsed_secs_val = float(elapsed_secs_str) if elapsed_secs_str else 0.0
-            except (ValueError, TypeError):
-                elapsed_secs_val = 0.0
-            
-            try:
-                cycle_count_str = row.get('full cycle count', '').strip()
-                cycle_count_val = int(cycle_count_str) if cycle_count_str and cycle_count_str.isdigit() else 0
-            except (ValueError, TypeError):
-                cycle_count_val = 0
-            
-            try:
-                partial_cycle_val = int(row['partial cycle count']) if row.get('partial cycle count', '').strip() else None
-            except (ValueError, TypeError):
-                partial_cycle_val = None
-            
-            try:
-                bars_dist_str = row.get('Disconnected Match Distance', '').strip()
-                bars_dist_val = float(bars_dist_str) if bars_dist_str else 0.0
-            except (ValueError, TypeError):
-                bars_dist_val = 0.0
-            
-            try:
-                int_dist_str = row.get('Connected Match Distance', '').strip()
-                int_dist_val = float(int_dist_str) if int_dist_str else 0.0
-            except (ValueError, TypeError):
-                int_dist_val = 0.0
-            
-            try:
-                other_count_str = row.get('Other Count', '').strip()
-                other_count_val = int(other_count_str) if other_count_str and other_count_str.isdigit() else 0
-            except (ValueError, TypeError):
-                other_count_val = 0
-            
-            # Row data order matches headers: Timestamp, Video Channel, Console Serial, Scope ID, State,
-            # Elapsed Secs, full cycle count, partial cycle count, Other Count, Event Type, Disconnected Match Distance, Connected Match Distance
-            row_data = [
-                row.get('Timestamp', ''),
-                video_channel_val,
-                row.get('Console Serial', ''),
-                row.get('Scope ID', ''),
-                state,
-                elapsed_secs_val,
-                cycle_count_val,
-                partial_cycle_val,
-                other_count_val,
-                row.get('Event Type', ''),
-                bars_dist_val,
-                int_dist_val
-            ]
-            ws.append(row_data)
-            data_rows_written += 1
-            
-            # Apply red background if State is "Other"
-            if state == 'Other':
-                for col_idx in range(1, len(headers) + 1):
-                    cell = ws.cell(row=row_num, column=col_idx)
-                    cell.fill = red_fill
-            
-            row_num += 1
-        
-        print(f"[Excel] Wrote {data_rows_written} data rows to Excel")
-        
-        if data_rows_written == 0:
-            print("[Excel] WARNING: No data rows were written to Excel file!")
-        
-        # Add filters to header row AFTER all data is written (includes all data rows)
-        if data_rows_written > 0:
-            last_col = get_column_letter(len(headers))
-            ws.auto_filter.ref = f"A1:{last_col}{row_num - 1}"
-            print(f"[Excel] Added filters to range A1:{last_col}{row_num - 1}")
-        else:
-            # Even if no data, set filter on header row
-            last_col = get_column_letter(len(headers))
-            ws.auto_filter.ref = f"A1:{last_col}1"
-            print("[Excel] WARNING: No data rows, only header row has filters")
-        
-        # Add report text and summary tally from CSV to Excel (in a separate sheet)
-        # Read the CSV to extract summary and report text
-        try:
-            report_text = ""
-            summary_lines = []
-            with open(csv_path_norm, 'r', encoding='utf-8') as f:
-                content = f.read()
-                # Find where SUMMARY starts
-                summary_start = content.find("SUMMARY")
-                # Find where report starts (look for "=" * 80 pattern)
-                report_start = content.find("=" * 80)
-                
-                # Extract summary section (between SUMMARY and report start)
-                if summary_start >= 0:
-                    summary_end = report_start if report_start >= 0 else len(content)
-                    summary_content = content[summary_start:summary_end].strip()
-                    if summary_content:
-                        summary_lines = summary_content.split('\n')
-                
-                # Extract report text
-                if report_start >= 0:
-                    report_text = content[report_start:].strip()
-            
-            # Create Report sheet with summary and report
-            if summary_lines or report_text:
-                report_sheet = wb.create_sheet("Report")
-                row_idx = 1
-                
-                # Write summary section first
-                if summary_lines:
-                    for line in summary_lines:
-                        if line.strip():  # Skip empty lines
-                            # Parse CSV-style summary line
-                            if ',' in line:
-                                # Split by comma and write to multiple columns
-                                parts = [p.strip() for p in line.split(',')]
-                                for col_idx, part in enumerate(parts, start=1):
-                                    report_sheet.cell(row=row_idx, column=col_idx, value=part)
-                            else:
-                                report_sheet.cell(row=row_idx, column=1, value=line)
-                            row_idx += 1
-                    # Add blank row separator
-                    row_idx += 1
-                
-                # Write report text
-                if report_text:
-                    report_lines = report_text.split('\n')
-                    for line in report_lines:
-                        report_sheet.cell(row=row_idx, column=1, value=line)
-                        row_idx += 1
-                
-                # Auto-adjust column widths for report
-                report_sheet.column_dimensions['A'].width = 100
-                for col in ['B', 'C', 'D', 'E', 'F', 'G']:
-                    report_sheet.column_dimensions[col].width = 20
-                print(f"[Excel] Added summary and report to 'Report' sheet ({row_idx - 1} total lines)")
-        except Exception as report_err:
-            print(f"[Excel] Warning: Could not add report/summary to Excel: {report_err}")
-            import traceback
-            traceback.print_exc()
-        
-        # Save Excel file
-        try:
-            wb.save(excel_path)
-            print(f"[Excel] Created Excel file from CSV with formatting and filters: {excel_path}")
-            print(f"[Excel] File size: {os.path.getsize(excel_path) if os.path.exists(excel_path) else 0} bytes")
-            return excel_path
-        except Exception as save_err:
-            print(f"[Excel] Error saving Excel file: {save_err}")
-            import traceback
-            traceback.print_exc()
-            raise
+        wb.save(excel_path)
+        print(f"[Excel] Created new file with formatted headers: {excel_path}")
+        return excel_path
     except Exception as e:
-        print(f"[Excel] Error creating Excel file from CSV: {e}")
-        print(f"[Excel] CSV path: {csv_path}")
-        print(f"[Excel] Excel path: {excel_path}")
-        import traceback
-        traceback.print_exc()
+        print(f"[Excel] Error creating file: {e}")
         return None
 
 def _append_to_excel(excel_path, row_data):
@@ -983,103 +653,14 @@ def _append_to_excel(excel_path, row_data):
     except Exception as e:
         print(f"[Excel] Error appending row: {e}")
 
-def _apply_excel_formatting(excel_path):
-    """Apply conditional formatting and ensure filters are enabled on Excel file."""
-    if not EXCEL_AVAILABLE or not excel_path or not os.path.exists(excel_path):
-        return
-    
-    try:
-        from openpyxl.styles import PatternFill
-        
-        wb = load_workbook(excel_path)
-        ws = wb.active
-        
-        # Ensure filters are enabled (in case file was created before filters were added)
-        # Order matches CSV: Timestamp, Video Channel, Console Serial, Scope ID, State,
-        # Elapsed Secs, full cycle count, partial cycle count, Other Count, Event Type, Disconnected Match Distance, Connected Match Distance
-        headers = [
-            "Timestamp", "Video Channel", "Console Serial", "Scope ID", "State",
-            "Elapsed Secs", "full cycle count", "partial cycle count",
-            "Other Count", "Event Type",
-            "Disconnected Match Distance", "Connected Match Distance"
-        ]
-        ws.auto_filter.ref = f"A1:{get_column_letter(len(headers))}1"
-        
-        # Find the State column (column E, index 5)
-        state_col_idx = 5  # Column E
-        
-        # Red background fill for "Other" state rows
-        red_fill = PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid")
-        
-        # Apply conditional formatting: red background for rows where State = "Other"
-        max_row = ws.max_row
-        for row_idx in range(2, max_row + 1):  # Start from row 2 (skip header)
-            state_cell = ws.cell(row=row_idx, column=state_col_idx)
-            if state_cell.value == "Other":
-                # Fill entire row with red background
-                for col_idx in range(1, len(headers) + 1):
-                    cell = ws.cell(row=row_idx, column=col_idx)
-                    cell.fill = red_fill
-        
-        wb.save(excel_path)
-        print(f"[Excel] Applied conditional formatting (red for 'Other' rows) and filters: {excel_path}")
-    except Exception as e:
-        print(f"[Excel] Error applying formatting: {e}")
-        import traceback
-        traceback.print_exc()
-
 def open_csv(path):
-    """Open CSV file and write column headers if file is new/empty. Excel file is created later when test ends."""
-    # Normalize path for Windows (handles network drives and spaces)
-    path = os.path.normpath(path)
-    
-    # Ensure parent directory exists
-    csv_dir = os.path.dirname(path)
-    if csv_dir:
-        try:
-            os.makedirs(csv_dir, exist_ok=True)
-            # Verify directory was actually created
-            if not os.path.exists(csv_dir):
-                raise OSError(f"Directory was not created: {csv_dir}")
-            # Check if we have write permission
-            if not os.access(csv_dir, os.W_OK):
-                raise PermissionError(f"No write permission to directory: {csv_dir}")
-        except Exception as e:
-            print(f"[open_csv] ERROR: Could not create or access directory {csv_dir}: {e}")
-            raise
+    """Open CSV file and write column headers if file is new/empty. Also creates Excel file."""
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     
     # Check if file exists and is empty
-    file_is_new = not os.path.exists(path) or (os.path.exists(path) and os.path.getsize(path) == 0)
+    file_is_new = not os.path.exists(path) or os.path.getsize(path) == 0
     
-    try:
-        # On Windows network drives, newline="" can cause errno 22
-        # Use encoding='utf-8' and let Python handle newlines
-        if platform.system() == "Windows":
-            f = open(path, "a", encoding='utf-8', newline='')
-        else:
-            f = open(path, "a", newline="")
-    except OSError as e:
-        if e.errno == 22:  # Invalid argument - try without newline parameter
-            print(f"[open_csv] WARNING: newline='' failed on Windows network drive, trying without it...")
-            try:
-                f = open(path, "a", encoding='utf-8')
-            except Exception as e2:
-                print(f"[open_csv] ERROR: Could not open CSV file: {path}")
-                print(f"[open_csv] Error: {e2}")
-                print(f"[open_csv] Directory exists: {os.path.exists(csv_dir) if csv_dir else 'N/A'}")
-                print(f"[open_csv] Directory writable: {os.access(csv_dir, os.W_OK) if csv_dir and os.path.exists(csv_dir) else 'N/A'}")
-                raise
-        else:
-            print(f"[open_csv] ERROR: Could not open CSV file: {path}")
-            print(f"[open_csv] Directory exists: {os.path.exists(csv_dir) if csv_dir else 'N/A'}")
-            print(f"[open_csv] Directory writable: {os.access(csv_dir, os.W_OK) if csv_dir and os.path.exists(csv_dir) else 'N/A'}")
-            raise
-    except Exception as e:
-        print(f"[open_csv] ERROR: Could not open CSV file: {path}")
-        print(f"[open_csv] Error: {e}")
-        print(f"[open_csv] Directory exists: {os.path.exists(csv_dir) if csv_dir else 'N/A'}")
-        print(f"[open_csv] Directory writable: {os.access(csv_dir, os.W_OK) if csv_dir and os.path.exists(csv_dir) else 'N/A'}")
-        raise
+    f = open(path, "a", newline="")
     w = csv.writer(f)
     
     if file_is_new:
@@ -1093,15 +674,18 @@ def open_csv(path):
             "Elapsed Secs",
             "full cycle count",
             "partial cycle count",
-            "Other Count",
-            "Event Type",
             "Disconnected Match Distance",
-            "Connected Match Distance"
+            "Connected Match Distance",
+            "Event Type"
         ]
         w.writerow(headers)
         f.flush()  # Ensure headers are written immediately
         print(f"[CSV] Created new file with headers: {path}")
-        # Note: Excel file will be created when test ends, not here
+        
+        # Also create Excel file with formatted headers
+        if EXCEL_AVAILABLE:
+            excel_path = _get_excel_path(path)
+            _create_excel_file(excel_path)
     
     return f, w
 
@@ -1113,80 +697,77 @@ def _get_equipment_for_video(video_num):
                 return info["serial"], info["scope_id"]
     return "", ""
 
-def _csv_append(video:int, state:str, elapsed_secs=None, bars_dist=None, int_dist=None, other_count=None, event_type:str="state_change"):
+def _csv_append(video:int, state:str, elapsed_secs=None, cycle_num=None, partial_cycle_num=None, bars_dist=None, int_dist=None, event_type:str="state_change"):
     """
-    Append a single event row to the current CSV file.
-    Only logs when detection is active and state has changed from last logged state.
+    Append a single event row to the current CSV and Excel file with enhanced format.
+    Only logs when detection is active.
     Columns: Timestamp, Video Channel, Console Serial, Scope ID, State, Elapsed Secs, 
-             full cycle count, partial cycle count, Disconnected Match Distance, Connected Match Distance, Other Count, Event Type
+             full cycle count, partial cycle count, Disconnected Match Distance, Connected Match Distance, Event Type
     
     Match distances are perceptual hash (pHash) distances comparing current frame to reference images.
     Lower values = closer match. Typical range: 0-20 (0=exact match).
     
-    Note: elapsed_secs will be calculated during post-processing. Cycle counts are also calculated during post-processing.
+    Note: elapsed_secs is not logged for NO_SIGNAL state.
     """
-    # Snapshot shared state once so we can log even if detection_active flips mid-write
+    # Only log when detection is active
     with mon.lock:
-        detection_active = mon.detection_active
-        csv_path = mon.csv_path
-        # Get tile index for this video channel
-        TILE_TO_VIDEO = [1, 3, 5, 2, 4, 6]
-        try:
-            tile_idx = TILE_TO_VIDEO.index(video)
-            last_logged = mon.tile_last_logged_state[tile_idx]
-        except (ValueError, IndexError):
-            last_logged = "UNKNOWN"
-
-    if not csv_path:
-        print("[CSV] Warning: csv_path is not set; skipping append")
-        return
-
-    if not detection_active and event_type != "test_start":
-        return
-    
-    # Avoid redundant consecutive logs of the same state
-    state_label = label_for(state)
-    if state_label == last_logged and event_type != "test_start":
-        return  # Skip logging if same state as last logged
+        if not mon.detection_active:
+            return
     
     try:
-        os.makedirs(os.path.dirname(csv_path) or ".", exist_ok=True)
+        os.makedirs(os.path.dirname(mon.csv_path) or ".", exist_ok=True)
         ts = datetime.now().isoformat(timespec="milliseconds")
         console_serial, scope_id = _get_equipment_for_video(video)
+        state_label = label_for(state)
         
-        # Elapsed time will be calculated during post-processing
-        # Cycle counts will also be calculated during post-processing
+        # Don't log elapsed_secs for NO_SIGNAL state
+        elapsed_value = None if state == "NO_SIGNAL" else elapsed_secs
         
-        # Prepare row data for CSV (strings) - columns in order: Timestamp, Video Channel, Console Serial, Scope ID, State,
-        # Elapsed Secs, full cycle count, partial cycle count, Other Count, Event Type, Disconnected Match Distance, Connected Match Distance
+        # Prepare row data for CSV (strings)
         csv_row_data = [
             ts,
             video,
             console_serial,
             scope_id,
             state_label,
-            "",  # Elapsed Secs - calculated during post-processing
-            "",  # full cycle count - calculated during post-processing
-            "",  # partial cycle count - not used anymore
-            other_count if other_count is not None else "",
-            event_type,
+            f"{elapsed_value:.2f}" if elapsed_value is not None else "",
+            cycle_num if cycle_num is not None else "",
+            partial_cycle_num if partial_cycle_num is not None else "",
             bars_dist if bars_dist is not None else "",
-            int_dist if int_dist is not None else ""
+            int_dist if int_dist is not None else "",
+            event_type
         ]
         
-        # Write to CSV only (Excel will be created from CSV when test ends)
-        with open(csv_path, "a", newline="") as _f:
+        # Prepare row data for Excel (numbers as numbers, not strings)
+        excel_row_data = [
+            ts,
+            int(video) if isinstance(video, (int, float)) else video,
+            console_serial,
+            scope_id,
+            state_label,
+            float(elapsed_value) if elapsed_value is not None else None,
+            int(cycle_num) if cycle_num is not None and cycle_num != "" else None,
+            int(partial_cycle_num) if partial_cycle_num is not None and partial_cycle_num != "" else None,
+            float(bars_dist) if bars_dist is not None and bars_dist != "" else None,
+            float(int_dist) if int_dist is not None and int_dist != "" else None,
+            event_type
+        ]
+        
+        # Write to CSV
+        with open(mon.csv_path, "a", newline="") as _f:
             _w = csv.writer(_f)
             _w.writerow(csv_row_data)
         
-        # Update last logged state for this channel
-        with mon.lock:
-            TILE_TO_VIDEO = [1, 3, 5, 2, 4, 6]
-            try:
-                tile_idx = TILE_TO_VIDEO.index(video)
-                mon.tile_last_logged_state[tile_idx] = state_label
-            except (ValueError, IndexError):
-                pass
+        # Also write to Excel if available
+        if EXCEL_AVAILABLE:
+            excel_path = _get_excel_path(mon.csv_path)
+            if os.path.exists(excel_path):
+                _append_to_excel(excel_path, excel_row_data)
+            else:
+                # Excel file doesn't exist yet, create it
+                _create_excel_file(excel_path)
+                _append_to_excel(excel_path, excel_row_data)
+                
     except Exception as e:
         print(f"[CSV] Error appending: {e}")
 
@@ -1463,56 +1044,14 @@ def decide(
         # Very dark ROI (essentially black) = No Signal, even if full frame isn't perfectly flat
         is_no_signal = True
     
-    # Use a more lenient threshold for BARS to prevent misclassification as OTHER
-    # This ensures Scope Disconnected is always detected correctly
-    bars_gate_lenient = bars_gate + 3  # Add 3 to the threshold for more lenient matching
-    bars_gate_very_lenient = bars_gate + 8  # Very lenient for color bar patterns
-    
-    # Check for color bar pattern characteristics:
-    # - Medium brightness (not white, not black)
-    # - Low white fraction (not the connected interface)
-    # - Some structure (not completely flat)
-    # - Reasonable pHash distance to BARS (even if not perfect match)
-    is_color_bar_like = (
-        not is_no_signal and
-        not strong_white and
-        not gray_ok and
-        roi_mean > 50.0 and roi_mean < 220.0 and  # Medium brightness range
-        white_frac_gray < 0.1 and  # Not white
-        white_frac_rgb < 0.1 and
-        std_lum > 10.0  # Has some structure (not flat)
-    )
-    
     if is_no_signal:
         det = "NO_SIGNAL"
-    elif db < bars_gate_lenient and not (phash_ok and (strong_white or gray_ok)):
-        # BARS: pHash matches disconnected reference, but NOT connected interface
-        # Check BARS BEFORE INTERFACE to prevent misclassification
-        det = "BARS"
-    elif is_color_bar_like and db < bars_gate_very_lenient:
-        # Color bar pattern detected: medium brightness, not white, reasonable BARS match
-        # This catches color bar test patterns that should be "Scope Disconnected"
-        det = "BARS"
     elif phash_ok and (strong_white or gray_ok):
         det = "INTERFACE"
     elif strong_white:
         det = "INTERFACE"
     elif db < bars_gate:
-        # Fallback BARS check (original threshold)
         det = "BARS"
-    elif is_color_bar_like:
-        # Last resort: if it looks like a color bar pattern, classify as BARS
-        # This prevents color bars from ever being classified as OTHER
-        # Color bars are a form of "Scope Disconnected" test pattern
-        det = "BARS"
-    elif not is_no_signal and not strong_white and not gray_ok and roi_mean > 50.0 and roi_mean < 220.0:
-        # Additional safety: if it's medium brightness, not white, not black, and not NO_SIGNAL,
-        # and we haven't matched anything else, prefer BARS over OTHER
-        # This catches edge cases where pHash might not match perfectly but pattern suggests BARS
-        if db < (bars_gate + 15):  # Very lenient threshold
-            det = "BARS"
-        else:
-            det = "OTHER"
     else:
         det = "OTHER"
 
@@ -1624,258 +1163,101 @@ def run_loop():
     if use_stream:
         cap = cv2.VideoCapture(mon.stream_path.strip())
     else:
-        # On Windows, try OBS Virtual Camera first - use EXACT same approach as obs.py
-        # Just try indices 1, 2, 3 in order (where OBS Virtual Camera appears when OBS is running)
-        # Don't pre-scan, don't release and reconnect - just try them directly like obs.py does
-        obs_tried = False
-        if platform.system() == "Windows":
-            # Check if OBS is running
-            obs_running = False
-            try:
-                result = subprocess.run(['tasklist', '/FI', 'IMAGENAME eq obs64.exe'], 
-                                      capture_output=True, timeout=1)
-                obs_running = result.returncode == 0 and b'obs64.exe' in result.stdout
-            except:
-                pass
-            
-            if obs_running:
-                # CRITICAL: Use pygrabber to get CURRENT index by camera name (like Zoom does)
-                # Camera indices can CHANGE between startup and now!
-                print(f"[run_loop] OBS is running - finding current OBS Virtual Camera index by name (pygrabber)...")
-                camera_names = get_directshow_camera_names()
-                obs_index_by_name = None
-                
-                if camera_names:
-                    print(f"[run_loop] Available cameras: {camera_names}")
-                    for idx, name in camera_names.items():
-                        name_lower = name.lower()
-                        if "obs" in name_lower and ("virtual" in name_lower or "camera" in name_lower):
-                            print(f"[run_loop] ✓✓ Found 'OBS Virtual Camera' by name at CURRENT index {idx}: '{name}' ✓✓")
-                            obs_index_by_name = idx
-                            break
-                else:
-                    print(f"[run_loop] ⚠ Could not get camera names via pygrabber, will scan by resolution")
-                
-                # Build indices list: name-detected index FIRST, then startup index, then scan
-                with mon.lock:
-                    startup_idx = mon.src if isinstance(mon.src, int) and mon.src >= 0 and mon.src < 11 else None
-                
-                indices_to_try = []
-                if obs_index_by_name is not None:
-                    indices_to_try.append(obs_index_by_name)
-                    print(f"[run_loop] Will try index {obs_index_by_name} FIRST (found by camera name - most reliable!)")
-                
-                if startup_idx is not None and startup_idx != obs_index_by_name:
-                    indices_to_try.append(startup_idx)
-                
-                # Add remaining indices
-                for i in [0, 1, 2, 3] + list(range(4, 11)):
-                    if i not in indices_to_try:
-                        indices_to_try.append(i)
-                
-                print(f"[run_loop] Will try indices in order: {indices_to_try}")
-                
-                for idx in indices_to_try:
-                    cap = None
-                    
-                    # For the startup index, add retry logic (Windows DSHOW may need time to release)
-                    max_retries = 5 if idx == startup_idx else 1
-                    retry_delay = 1.5  # 1.5 seconds between retries
-                    
-                    for retry in range(max_retries):
-                        try:
-                            if retry > 0:
-                                print(f"[run_loop] Retry {retry}/{max_retries-1} for index {idx} (waiting {retry_delay}s...)...")
-                                time.sleep(retry_delay)
-                                import gc
-                                gc.collect()  # Force garbage collection between retries
-                            else:
-                                print(f"[run_loop] Trying index {idx} with DSHOW backend...")
-                            
-                            cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
-                            if cap and cap.isOpened():
-                                print(f"[run_loop]   ✓ Opened index {idx}")
-                                
-                                # Set buffer size to 1 FIRST (critical for real-time updates)
-                                try:
-                                    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                                except Exception:
-                                    pass
-                                
-                                # Set resolution to 1920x1080 (exactly like obs.py)
-                                try:
-                                    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
-                                    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
-                                    cap.set(cv2.CAP_PROP_FPS, 30)
-                                except Exception as e:
-                                    print(f"[run_loop]   ⚠ Could not set resolution/FPS: {e}")
-                                
-                                # Read a frame to verify it works (exactly like obs.py)
-                                ret, frame = cap.read()
-                                if ret and frame is not None:
-                                    h, w = frame.shape[:2]
-                                    print(f"[run_loop]   ✓ Read frame: {w}x{h}")
-                                    
-                                    # If it's 1920x1080, this is OBS Virtual Camera - use it!
-                                    if w == 1920 and h == 1080:
-                                        print(f"[run_loop] ✓✓✓ FOUND OBS Virtual Camera at index {idx} (1920x1080, DSHOW) ✓✓✓")
-                                        with mon.lock:
-                                            mon.src = idx
-                                            mon.backend_name = "DSHOW"
-                                        obs_tried = True
-                                        break  # Break out of retry loop - camera found!
-                                    else:
-                                        # Not 1920x1080, release and try next index
-                                        print(f"[run_loop]   ✗ Index {idx} is {w}x{h}, not 1920x1080 (not OBS Virtual Camera)")
-                                        try:
-                                            cap.release()
-                                        except Exception:
-                                            pass
-                                        cap = None
-                                        break  # Break out of retry loop - wrong resolution
-                                else:
-                                    # Can't read frames
-                                    print(f"[run_loop]   ✗ Cannot read frames from index {idx}")
-                                    try:
-                                        cap.release()
-                                    except Exception:
-                                        pass
-                                    cap = None
-                                    # Don't break - retry if this is startup index
-                            else:
-                                # Can't open
-                                print(f"[run_loop]   ✗ Cannot open index {idx}")
-                                if cap:
-                                    try:
-                                        cap.release()
-                                    except Exception:
-                                        pass
-                                cap = None
-                                # Don't break - retry if this is startup index
-                        except Exception as e:
-                            # Error opening
-                            print(f"[run_loop]   ✗ Error with index {idx}: {e}")
-                            if cap:
-                                try:
-                                    cap.release()
-                                except Exception:
-                                    pass
-                            cap = None
-                            # Don't break - retry if this is startup index
-                    
-                    # If we found the camera (obs_tried=True), break out of indices loop
-                    if obs_tried:
-                        break
-                
-                if obs_tried:
-                    # Verify we have a valid camera connection
-                    if cap and cap.isOpened():
-                        print(f"[run_loop] ✓✓✓ OBS Virtual Camera CONNECTED and ready to use at index {mon.src} ✓✓✓")
-                    else:
-                        print(f"[run_loop] ⚠⚠⚠ ERROR: OBS Virtual Camera found but connection lost!")
-                        obs_tried = False  # Reset so we try fallback
-                else:
-                    print(f"[run_loop] ⚠⚠⚠ OBS Virtual Camera NOT FOUND at any index (0-10)")
-                    print(f"[run_loop]    Make sure OBS Virtual Camera is started (Tools > Start Virtual Camera)")
-                    print(f"[run_loop]    OBS Virtual Camera should output 1920x1080 video")
-            else:
-                print(f"[run_loop] ⚠ OBS Studio is not running. OBS Virtual Camera is not available.")
-        
-        # If OBS Virtual Camera wasn't found, try user-selected source
-        # BUT: If OBS is running, we MUST use OBS Virtual Camera, don't fall back to other sources
-        skip_fallback_due_to_obs = False
-        if not obs_tried and (not cap or not cap.isOpened()):
-            if platform.system() == "Windows":
-                # Check if OBS is running again
-                obs_running_check = False
+        # Use obs.py method for Windows/OBS: index 1 with DSHOW backend
+        if platform.system() == "Windows" and isinstance(mon.src, int) and mon.src == 1 and mon.backend_name == "DSHOW":
+            # Direct obs.py method: open index 1 with DSHOW backend (exactly like obs.py)
+            print(f"[run_loop] Using obs.py method: opening index 1 with DSHOW backend")
+            cap = cv2.VideoCapture(1, cv2.CAP_DSHOW)
+            if cap and cap.isOpened():
+                # Set buffer size to 1 FIRST (critical for real-time updates)
                 try:
-                    result = subprocess.run(['tasklist', '/FI', 'IMAGENAME eq obs64.exe'], 
-                                          capture_output=True, timeout=1)
-                    obs_running_check = result.returncode == 0 and b'obs64.exe' in result.stdout
-                except:
+                    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                except Exception:
                     pass
                 
-                if obs_running_check:
-                    # OBS is running but we didn't find OBS Virtual Camera - this is an error
-                    print(f"[run_loop] ⚠⚠⚠ CRITICAL: OBS is running but OBS Virtual Camera not found!")
-                    print(f"[run_loop]    Please ensure OBS Virtual Camera is started:")
-                    print(f"[run_loop]    1. In OBS Studio, go to Tools > Start Virtual Camera")
-                    print(f"[run_loop]    2. Make sure it's outputting 1920x1080")
-                    print(f"[run_loop]    3. Check that no other application is using OBS Virtual Camera")
-                    print(f"[run_loop]    Will NOT connect to other cameras when OBS is running.")
-                    # Don't try other sources - we need OBS Virtual Camera specifically
-                    cap = None
-                    skip_fallback_due_to_obs = True
-                else:
-                    # OBS not running, try user-selected source
-                    cap = _open_with_backend(mon.src, backend)
+                # Set resolution and FPS like obs.py does (AFTER opening)
+                try:
+                    rp = (mon.res_preset or "1080p").lower()
+                    if rp == "720p":
+                        w, h = 1280, 720
+                    else:
+                        w, h = 1920, 1080
+                    cap.set(cv2.CAP_PROP_FRAME_WIDTH, w)
+                    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
+                    cap.set(cv2.CAP_PROP_FPS, 30)
+                    print(f"[run_loop] ✓ OBS Virtual Camera opened (obs.py method) - set to {w}x{h}")
+                except Exception as e:
+                    print(f"[run_loop] ⚠ Could not set resolution/FPS: {e}")
+                
+                # Flush any buffered frames to ensure we get the latest
+                try:
+                    for _ in range(3):
+                        cap.read()
+                except Exception:
+                    pass
             else:
-                # Not Windows, try user-selected source
-                cap = _open_with_backend(mon.src, backend)
-            
-            if cap and cap.isOpened():
-                # Successfully connected to user-selected source
-                print(f"[run_loop] ✓ Successfully connected to camera index {mon.src}")
-            
+                print(f"[run_loop] ⚠ Failed to open OBS Virtual Camera with obs.py method")
+                cap = None
+        else:
+            # Try selected backend, then fallback (Windows: MSMF<->DSHOW)
+            cap = _open_with_backend(mon.src, backend)
             if (not cap) or (not cap.isOpened()):
-                if not skip_fallback_due_to_obs:
-                    if platform.system() == "Windows":
-                        # Simple fallback: try alternate backend
-                        alt_backend = cv2.CAP_DSHOW if backend == cv2.CAP_MSMF else cv2.CAP_MSMF
+                if platform.system() == "Windows":
+                    # Simple fallback: try alternate backend
+                    alt_backend = cv2.CAP_DSHOW if backend == cv2.CAP_MSMF else cv2.CAP_MSMF
+                    try:
+                        if cap: cap.release()
+                    except Exception:
+                        pass
+                    cap = _open_with_backend(mon.src, alt_backend)
+                    
+                    # If still not opened and OBS might be running, try obs.py method (index 1 with DSHOW)
+                    if (not cap) or (not cap.isOpened()):
                         try:
-                            if cap: cap.release()
-                        except Exception:
-                            pass
-                        cap = _open_with_backend(mon.src, alt_backend)
-                        
-                        # If still not opened, try scanning for OBS Virtual Camera
-                        if (not cap) or (not cap.isOpened()):
-                            try:
-                                print(f"[run_loop] User-selected source failed, scanning for OBS Virtual Camera...")
+                            obs_check = subprocess.run(['tasklist', '/FI', 'IMAGENAME eq obs64.exe'], 
+                                                      capture_output=True, timeout=1)
+                            obs_running = obs_check.returncode == 0 and b'obs64.exe' in obs_check.stdout
+                            if obs_running:
+                                print(f"[run_loop] OBS detected, trying obs.py method: index 1 with DSHOW...")
                                 if cap:
                                     try:
                                         cap.release()
                                     except:
                                         pass
-                                
-                                # Scan for OBS Virtual Camera (1920x1080, DSHOW)
-                                obs_idx, found = find_obs_virtual_camera()
-                                if found:
-                                    print(f"[run_loop] Found OBS Virtual Camera at index {obs_idx}, connecting...")
-                                    for retry in range(3):
-                                        if retry > 0:
-                                            print(f"[run_loop] Retry {retry} connecting to OBS Virtual Camera at index {obs_idx}...")
-                                            time.sleep(0.2)
-                                        
-                                        cap = cv2.VideoCapture(obs_idx, cv2.CAP_DSHOW)
-                                        if cap and cap.isOpened():
-                                            try:
-                                                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                                                cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
-                                                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
-                                                cap.set(cv2.CAP_PROP_FPS, 30)
-                                                for _ in range(3):
-                                                    cap.read()
-                                                test_ok, test_frame = cap.read()
-                                                if test_ok and test_frame is not None:
-                                                    h, w = test_frame.shape[:2]
-                                                    if w == 1920 and h == 1080:
-                                                        with mon.lock:
-                                                            mon.src = obs_idx
-                                                            mon.backend_name = "DSHOW"
-                                                        print(f"[run_loop] ✓ Connected to OBS Virtual Camera at index {obs_idx} (1920x1080, DSHOW)")
-                                                        obs_tried = True
-                                                        break
-                                            except Exception:
-                                                pass
-                                            if not obs_tried:
-                                                try:
-                                                    cap.release()
-                                                except Exception:
-                                                    pass
-                                                cap = None
-                            except:
-                                pass
+                                cap = cv2.VideoCapture(1, cv2.CAP_DSHOW)
+                                if cap and cap.isOpened():
+                                    # Set buffer size to 1 FIRST (critical for real-time updates)
+                                    try:
+                                        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                                    except Exception:
+                                        pass
+                                    
+                                    # Set resolution and FPS like obs.py does
+                                    try:
+                                        rp = (mon.res_preset or "1080p").lower()
+                                        if rp == "720p":
+                                            w, h = 1280, 720
+                                        else:
+                                            w, h = 1920, 1080
+                                        cap.set(cv2.CAP_PROP_FRAME_WIDTH, w)
+                                        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
+                                        cap.set(cv2.CAP_PROP_FPS, 30)
+                                    except Exception:
+                                        pass
+                                    
+                                    # Flush any buffered frames to ensure we get the latest
+                                    try:
+                                        for _ in range(3):
+                                            cap.read()
+                                    except Exception:
+                                        pass
+                                    
+                                    with mon.lock:
+                                        mon.src = 1
+                                        mon.backend_name = "DSHOW"
+                                    print(f"[run_loop] ✓ Connected to OBS Virtual Camera (obs.py method)")
+                        except:
+                            pass
             elif platform.system() == "Darwin":
                 # Try several AVFoundation indices and pick the first non‑black feed.
                 try:
@@ -1884,14 +1266,6 @@ def run_loop():
                     pass
                 fourcc_sel = (mon.fourcc or "auto").upper()
                 want_w, want_h = (1280, 720) if (mon.res_preset or "1080p").lower()=="720p" else (1920, 1080)
-                
-                # Check if startup already detected OBS Virtual Camera at a specific index
-                # If so, try that index first
-                startup_idx = None
-                if isinstance(mon.src, int) and mon.src > 0:
-                    startup_idx = mon.src
-                    print(f"[run_loop] Startup detected camera at index {startup_idx}, trying that first...")
-                
                 # Check if OBS is running - if so, prioritize indices 1,2,3 over 0 (FaceTime)
                 obs_running = False
                 try:
@@ -1899,18 +1273,10 @@ def run_loop():
                     obs_running = result.returncode == 0
                 except:
                     pass
-                
-                # Build indices list: if startup found a specific index, try that first
-                if startup_idx is not None:
-                    indices_to_try = [startup_idx] + [i for i in [1, 2, 3, 0, 4, 5] if i != startup_idx]
-                elif obs_running:
-                    # If OBS is running, try indices 1,2,3 first (OBS Virtual Camera), then 0 (FaceTime)
-                    indices_to_try = [1, 2, 3, 0, 4, 5]
-                else:
-                    # Otherwise, try in normal order
-                    indices_to_try = [1, 0, 2, 3, 4, 5]
-                
-                print(f"[run_loop] Trying multiple AVFoundation indices to find a live source... (OBS running: {obs_running}, startup index: {startup_idx})")
+                # If OBS is running, try indices 1,2,3 first (OBS Virtual Camera), then 0 (FaceTime)
+                # Otherwise, try in normal order
+                indices_to_try = [1, 2, 3, 0, 4, 5] if obs_running else [1, 0, 2, 3, 4, 5]
+                print(f"[run_loop] Trying multiple AVFoundation indices to find a live source... (OBS running: {obs_running})")
                 cap, used_idx = _mac_try_indices_for_nonblack(indices_to_try, cv2.CAP_AVFOUNDATION, want_w, want_h, fourcc_sel)
                 if cap is None:
                     # last ditch: open the requested index even if black, so UI can still adjust
@@ -1924,20 +1290,9 @@ def run_loop():
                 if used_idx is not None:
                     print(f"[run_loop] ✓ macOS using AVFoundation index {used_idx}")
     
-    # Check if we're using OBS Virtual Camera (DSHOW backend, 1920x1080)
-    # Verify by checking actual frame resolution
-    is_obs_method = False
-    if platform.system() == "Windows" and isinstance(mon.src, int) and mon.backend_name == "DSHOW":
-        # Verify it's actually 1920x1080 (OBS Virtual Camera signature)
-        if cap and cap.isOpened():
-            try:
-                actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-                actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                if actual_w == 1920 and actual_h == 1080:
-                    is_obs_method = True
-                    print(f"[run_loop] Confirmed OBS Virtual Camera: index {mon.src}, {actual_w}x{actual_h}, DSHOW")
-            except Exception:
-                pass
+    # Check if we're using obs.py method AFTER all camera opening attempts
+    # This must be checked AFTER the fallback path might have updated mon.src and mon.backend_name
+    is_obs_method = (platform.system() == "Windows" and isinstance(mon.src, int) and mon.src == 1 and mon.backend_name == "DSHOW")
     
     # Normalize capture on Windows/OBS to reduce flicker and colorspace issues
     # For OBS Virtual Camera (obs.py method), buffer size is already set, skip redundant settings
@@ -2083,6 +1438,10 @@ def run_loop():
             time.sleep(0.05)  # 50ms between reads
         print(f"[run_loop] Warmup complete, baseline: shape={baseline_shape}, mean={baseline_mean:.1f}")
 
+    # CSV file handle - only opened when detection starts
+    csv_file = None
+    csv_writer = None
+    
     with mon.lock:
         mon.status = "video_ready"
         mon.video_running = True
@@ -2092,8 +1451,9 @@ def run_loop():
             with mon.lock:
                 if not mon.video_running:
                     break
-                # When detection engages for a new run, stamp the start time once
-                if mon.detection_active and mon.test_start_time is None:
+                # Open CSV file when detection first starts
+                if mon.detection_active and csv_file is None:
+                    csv_file, csv_writer = open_csv(mon.csv_path)
                     mon.test_start_time = datetime.now()
                     mon.status = "detecting"
                     print(f"[run_loop] Detection activated, logging to: {mon.csv_path}")
@@ -2224,19 +1584,14 @@ def run_loop():
                     # log row
                     changed = True
 
-            try:
-                _annotated_grid_from_frame(frame)
-            except Exception as e:
-                print(f"[run_loop] Warning: grid annotation failed: {e}")
-                import traceback
-                traceback.print_exc()
-            
             if not mon.video_running:
                 break
             if not changed:
                 time.sleep(0.05)
     finally:
         cap.release()
+        if csv_file:
+            csv_file.close()
         with mon.lock:
             if mon.video_running:
                 mon.status = "stopped"
@@ -2245,54 +1600,23 @@ def run_loop():
                 mon.running = False
             mon.worker = None
 
-def _post_process_csv():
+def _recalculate_elapsed_times_from_no_signal():
     """
-    Post-process CSV to:
-    1. Calculate elapsed time as duration of each state (time spent in that state)
-    2. Count full cycles based on state transitions:
-       - Video 1,3,5: No Signal → Scope Disconnected → Scope Connected
-       - Video 2,4,6: No Signal → Scope Connected
-    3. Store statistics for report generation
-    Returns: (rows, channel_stats, cycle_counts)
+    Post-process CSV to recalculate elapsed times:
+    - Scope Connected: timestamp of Scope Connected - timestamp of previous No Signal
+    - Scope Disconnected: timestamp of Scope Disconnected - timestamp of previous No Signal
+    This is done per channel.
     """
-    # Get CSV path with lock
-    with mon.lock:
-        csv_path = mon.csv_path
-    
-    # Check if CSV path is set
-    if not csv_path:
-        print("[Post-Process] ERROR: CSV path is not set. Was 'Start Test' clicked?")
-        print("[Post-Process] This usually means the test was never started properly.")
-        return None, None, None, None, None
-    
-    # Normalize path
-    csv_path = os.path.normpath(csv_path)
-    
-    # Check if CSV file exists
-    if not os.path.exists(csv_path):
-        print(f"[Post-Process] ERROR: CSV file not found at: {csv_path}")
-        print(f"[Post-Process] File exists: {os.path.exists(csv_path)}")
-        print(f"[Post-Process] Parent directory exists: {os.path.exists(os.path.dirname(csv_path)) if os.path.dirname(csv_path) else 'N/A'}")
-        print(f"[Post-Process] This usually means:")
-        print(f"[Post-Process]   1. 'Start Test' was never clicked, or")
-        print(f"[Post-Process]   2. CSV file creation failed during 'Start Test', or")
-        print(f"[Post-Process]   3. The file was deleted or moved")
-        return None, None, None, None, None
-    
-    # Check if CSV file is readable
-    if not os.access(csv_path, os.R_OK):
-        print(f"[Post-Process] ERROR: CSV file exists but is not readable: {csv_path}")
-        return None, None, None, None, None
-    
-    print(f"[Post-Process] Processing CSV file: {csv_path}")
-    print(f"[Post-Process] File size: {os.path.getsize(csv_path)} bytes")
+    if not os.path.exists(mon.csv_path):
+        print("[Post-Process] CSV file not found, skipping elapsed time recalculation")
+        return
     
     try:
         # Read all rows from CSV, separating data from report text
         rows = []
         report_text = ""
         
-        with open(csv_path, 'r', newline='', encoding='utf-8') as f:
+        with open(mon.csv_path, 'r', newline='') as f:
             content = f.read()
         
         # Find where report starts (look for "=" * 80 pattern)
@@ -2313,205 +1637,134 @@ def _post_process_csv():
         
         if not rows:
             print("[Post-Process] No data rows found in CSV")
-            return None, None, None, None, None
+            return
         
-        # Get test end time (current time or last row timestamp)
-        test_end_time = datetime.now()
-        if rows:
-            try:
-                last_ts_str = rows[-1].get('Timestamp', '').strip()
-                if last_ts_str:
-                    last_ts = datetime.fromisoformat(last_ts_str.replace('Z', '+00:00'))
-                    if last_ts.tzinfo:
-                        last_ts = last_ts.replace(tzinfo=None)
-                    test_end_time = last_ts
-            except:
-                pass
+        # Track last "No Signal" timestamp per channel (separate tracking for each video channel 1-6)
+        # This ensures elapsed times are calculated from the most recent "No Signal" for the SAME channel
+        last_no_signal_ts = {}  # video_channel (int) -> timestamp (float, in seconds)
         
-        # Group rows by video channel and sort by timestamp
-        channel_rows = {}  # video_num -> list of rows in chronological order
+        # Process each row in chronological order and update elapsed times
+        # Note: Rows should already be in chronological order from CSV, but we process sequentially
         for row in rows:
-            try:
-                video_num = int(row.get('Video Channel', '').strip())
-                if video_num not in channel_rows:
-                    channel_rows[video_num] = []
-                channel_rows[video_num].append(row)
-            except (ValueError, TypeError):
-                continue
-        
-        # Sort each channel's rows by timestamp
-        for video_num in channel_rows:
-            channel_rows[video_num].sort(key=lambda r: r.get('Timestamp', ''))
-        
-        # Track statistics per channel
-        channel_stats = {}  # video_num -> {state -> [durations]}
-        cycle_counts = {}  # video_num -> count
-        partial_cycle_counts = {}  # video_num -> count (for partial cycles)
-        transition_times_246 = {}  # video_num -> [transition times from No Signal to Scope Connected]
-        
-        # Process each channel separately
-        for video_num in sorted(channel_rows.keys()):
-            channel_rows_list = channel_rows[video_num]
-            channel_stats[video_num] = {
-                "No Signal": [],
-                "Scope Disconnected": [],
-                "Scope Connected": [],
-                "Other": []
-            }
-            cycle_counts[video_num] = 0
-            partial_cycle_counts[video_num] = 0
-            if video_num in [2, 4, 6]:
-                transition_times_246[video_num] = []
-            
-            # Track state transitions for cycle counting
-            prev_state = None
-            prev_state_ts = None
-            prev_prev_state = None  # For Video 1,3,5 cycle detection
-            
-            # Process each row for this channel
-            for i, row in enumerate(channel_rows_list):
-                state = row.get('State', '').strip()
-                timestamp_str = row.get('Timestamp', '').strip()
-                
-                if not state or not timestamp_str:
-                    continue
-                
-                try:
-                    timestamp = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
-                    if timestamp.tzinfo:
-                        timestamp = timestamp.replace(tzinfo=None)
-                    timestamp_secs = timestamp.timestamp()
-                except (ValueError, TypeError):
-                    continue
-                
-                # Calculate elapsed time (duration of previous state)
-                if prev_state is not None and prev_state_ts is not None:
-                    elapsed = timestamp_secs - prev_state_ts
-                    # Update previous row's elapsed time
-                    if i > 0:
-                        prev_row = channel_rows_list[i-1]
-                        prev_row['Elapsed Secs'] = f"{elapsed:.2f}"
-                        # Track duration for statistics
-                        if prev_state in channel_stats[video_num]:
-                            channel_stats[video_num][prev_state].append(elapsed)
-                
-                # Count cycles based on state transitions
-                if video_num in [1, 3, 5]:
-                    # Video 1,3,5: Full cycle = No Signal → Scope Disconnected → Scope Connected
-                    if prev_state == "Scope Disconnected" and state == "Scope Connected":
-                        # Check if we came from No Signal before Disconnected
-                        if prev_prev_state == "No Signal":
-                            cycle_counts[video_num] += 1
-                            row['full cycle count'] = str(cycle_counts[video_num])
-                    # Partial cycle for Video 1,3,5: No Signal → Scope Disconnected → No Signal (without reaching Connected)
-                    elif prev_state == "Scope Disconnected" and state == "No Signal":
-                        # Check if we came from No Signal before Disconnected
-                        if prev_prev_state == "No Signal":
-                            partial_cycle_counts[video_num] += 1
-                            row['partial cycle count'] = str(partial_cycle_counts[video_num])
-                elif video_num in [2, 4, 6]:
-                    # Video 2,4,6: Full cycle = No Signal → Scope Connected
-                    if prev_state == "No Signal" and state == "Scope Connected":
-                        cycle_counts[video_num] += 1
-                        row['full cycle count'] = str(cycle_counts[video_num])
-                        # Calculate transition time (time from No Signal to Scope Connected)
-                        if prev_state_ts is not None:
-                            transition_time = timestamp_secs - prev_state_ts
-                            transition_times_246[video_num].append(transition_time)
-                
-                # Update partial cycle count for all rows (carry forward the count)
-                # Set partial cycle count for this row
-                row['partial cycle count'] = str(partial_cycle_counts[video_num])
-                
-                # Update for next iteration
-                prev_prev_state = prev_state
-                prev_state = state
-                prev_state_ts = timestamp_secs
-            
-            # Calculate elapsed time for the last state (from last timestamp to test end)
-            if prev_state is not None and prev_state_ts is not None:
-                last_elapsed = test_end_time.timestamp() - prev_state_ts
-                if channel_rows_list:
-                    channel_rows_list[-1]['Elapsed Secs'] = f"{last_elapsed:.2f}"
-                    if prev_state in channel_stats[video_num]:
-                        channel_stats[video_num][prev_state].append(last_elapsed)
-        
-        # Reconstruct all rows in original order (but with updated elapsed times and cycle counts)
-        all_rows_sorted = []
-        for row in rows:
-            video_num = int(row.get('Video Channel', '').strip()) if row.get('Video Channel', '').strip().isdigit() else None
+            video_channel = row.get('Video Channel', '').strip()
+            state = row.get('State', '').strip()
             timestamp_str = row.get('Timestamp', '').strip()
-            if video_num and timestamp_str:
-                # Find matching row in channel_rows
-                for ch_row in channel_rows.get(video_num, []):
-                    if ch_row.get('Timestamp', '').strip() == timestamp_str:
-                        all_rows_sorted.append(ch_row)
-                        break
+            
+            if not video_channel or not state or not timestamp_str:
+                continue
+            
+            try:
+                video_num = int(video_channel)
+                # Parse timestamp and convert to seconds (consistent units for calculation)
+                timestamp = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
+                if timestamp.tzinfo:
+                    timestamp = timestamp.replace(tzinfo=None)
+                timestamp_secs = timestamp.timestamp()  # Convert to seconds (float)
+            except (ValueError, TypeError) as e:
+                continue
+            
+            # Track "No Signal" timestamps per channel
+            # Each channel maintains its own separate "last No Signal" timestamp
+            if state == "No Signal":
+                last_no_signal_ts[video_num] = timestamp_secs  # Update this channel's last No Signal time
+                # Reset elapsed time for No Signal (not calculated from previous No Signal)
+                row['Elapsed Secs'] = ''
+            # Calculate elapsed time for Scope Connected/Disconnected
+            # Uses the most recent "No Signal" timestamp for THIS SPECIFIC channel
+            elif state in ["Scope Connected", "Scope Disconnected"]:
+                if video_num in last_no_signal_ts:
+                    # Calculate elapsed time: current timestamp - last No Signal timestamp for this channel
+                    # Both timestamps are in seconds, so result is in seconds
+                    elapsed = timestamp_secs - last_no_signal_ts[video_num]
+                    row['Elapsed Secs'] = f"{elapsed:.2f}"
                 else:
-                    all_rows_sorted.append(row)
-            else:
-                all_rows_sorted.append(row)
+                    # No previous No Signal found for this channel, keep existing or set to empty
+                    if not row.get('Elapsed Secs'):
+                        row['Elapsed Secs'] = ''
         
-        # Write updated CSV with headers
+        # Write updated rows back to CSV
         fieldnames = [
             "Timestamp", "Video Channel", "Console Serial", "Scope ID", "State",
-            "Elapsed Secs", "full cycle count", "partial cycle count",
-            "Other Count", "Event Type",
-            "Disconnected Match Distance", "Connected Match Distance"
+            "Elapsed Secs", "full cycle count", "partial cycle count", "Disconnected Match Distance",
+            "Connected Match Distance", "Event Type"
         ]
         
-        with open(csv_path, 'w', newline='') as f:
+        # Write updated CSV with headers
+        with open(mon.csv_path, 'w', newline='') as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
-            for row in all_rows_sorted:
+            for row in rows:
                 writer.writerow(row)
-            f.flush()
-            os.fsync(f.fileno())  # Force write to disk
         
         # Append report text back if it existed
         if report_text:
-            with open(csv_path, 'a', newline='') as f:
+            with open(mon.csv_path, 'a', newline='') as f:
                 f.write(report_text)
-                f.flush()
-                os.fsync(f.fileno())  # Force write to disk
         
-        print("[Post-Process] Elapsed times and cycle counts calculated successfully")
-        return all_rows_sorted, channel_stats, cycle_counts, partial_cycle_counts, transition_times_246
+        # Also update Excel file if it exists
+        if EXCEL_AVAILABLE:
+            excel_path = _get_excel_path(mon.csv_path)
+            if excel_path and os.path.exists(excel_path):
+                try:
+                    wb = load_workbook(excel_path)
+                    ws = wb.active
+                    
+                    # Clear existing data (keep header row)
+                    for row in range(2, ws.max_row + 1):
+                        ws.delete_rows(row)
+                    
+                    # Write updated rows (convert numeric strings to numbers for Excel)
+                    for row_data in rows:
+                        # Convert numeric fields to proper types
+                        elapsed_secs_str = row_data.get('Elapsed Secs', '').strip()
+                        elapsed_secs = float(elapsed_secs_str) if elapsed_secs_str and elapsed_secs_str != '' else None
+                        
+                        cycle_num_str = str(row_data.get('full cycle count', '')).strip()
+                        cycle_num = int(cycle_num_str) if cycle_num_str and cycle_num_str != '' and cycle_num_str.isdigit() else None
+                        
+                        partial_cycle_num_str = str(row_data.get('partial cycle count', '')).strip()
+                        partial_cycle_num = int(partial_cycle_num_str) if partial_cycle_num_str and partial_cycle_num_str != '' and partial_cycle_num_str.isdigit() else None
+                        
+                        bars_dist_str = str(row_data.get('Disconnected Match Distance', '')).strip()
+                        bars_dist = float(bars_dist_str) if bars_dist_str and bars_dist_str != '' else None
+                        
+                        int_dist_str = str(row_data.get('Connected Match Distance', '')).strip()
+                        int_dist = float(int_dist_str) if int_dist_str and int_dist_str != '' else None
+                        
+                        video_channel_str = str(row_data.get('Video Channel', '')).strip()
+                        video_channel = int(video_channel_str) if video_channel_str and video_channel_str.isdigit() else video_channel_str
+                        
+                        row_values = [
+                            row_data.get('Timestamp', ''),
+                            video_channel,
+                            row_data.get('Console Serial', ''),
+                            row_data.get('Scope ID', ''),
+                            row_data.get('State', ''),
+                            elapsed_secs,  # Number, not string
+                            cycle_num,  # Number, not string
+                            partial_cycle_num,  # Number, not string
+                            bars_dist,  # Number, not string
+                            int_dist,  # Number, not string
+                            row_data.get('Event Type', '')
+                        ]
+                        ws.append(row_values)
+                    
+                    wb.save(excel_path)
+                    print(f"[Post-Process] Updated Excel file: {excel_path}")
+                except Exception as e:
+                    print(f"[Post-Process] Error updating Excel file: {e}")
+        
+        print(f"[Post-Process] Recalculated elapsed times from No Signal for {len(rows)} rows")
         
     except Exception as e:
-        print(f"[Post-Process] Error post-processing CSV: {e}")
-        import traceback
-        traceback.print_exc()
-        return None, None, None, None, None
-
-def _save_log_to_file(log_file_path):
-    """Save the log buffer to a file."""
-    try:
-        with _log_lock:
-            log_content = '\n'.join(_log_buffer)
-        
-        # Ensure directory exists
-        log_dir = os.path.dirname(log_file_path)
-        if log_dir:
-            os.makedirs(log_dir, exist_ok=True)
-        
-        # Write log to file
-        with open(log_file_path, 'w', encoding='utf-8') as f:
-            f.write(log_content)
-        
-        print(f"[Log] Saved {len(_log_buffer)} log entries to {log_file_path}")
-    except Exception as e:
-        print(f"[Log] Error saving log file: {e}")
+        print(f"[Post-Process] Error recalculating elapsed times: {e}")
         import traceback
         traceback.print_exc()
 
-def _generate_and_append_report(channel_stats=None, cycle_counts=None, transition_times_246=None):
+def _generate_and_append_report():
     """
     Generate a comprehensive test report with cycle statistics, timing analysis,
     and identification of incomplete cycles. Append to the CSV file.
-    channel_stats: dict mapping video_num -> {state -> [durations]}
-    cycle_counts: dict mapping video_num -> count
-    transition_times_246: dict mapping video_num (2,4,6) -> [transition times from No Signal to Scope Connected]
     Returns: (report_text, csv_path)
     """
     report_lines = []
@@ -2556,49 +1809,14 @@ def _generate_and_append_report(channel_stats=None, cycle_counts=None, transitio
     report_lines.append("-" * 80)
     TILE_TO_VIDEO = [1, 3, 5, 2, 4, 6]
     
-    # Use cycle_counts from post-processing if available
-    if cycle_counts is None:
-        cycle_counts = {}
-    
-    # Use channel_stats from post-processing if available
-    if channel_stats is None:
-        channel_stats = {}
-    
     for tile_idx in range(GRID_FEEDS):
         video_num = TILE_TO_VIDEO[tile_idx]
         console_serial, scope_id = _get_equipment_for_video(video_num)
         
         report_lines.append(f"\nVideo Channel {video_num} (Console: {console_serial}, Scope: {scope_id})")
-        report_lines.append(f"  Complete Cycles: {cycle_counts.get(video_num, 0)}")
+        report_lines.append(f"  Complete Cycles: {mon.tile_complete_cycles[tile_idx]}")
         report_lines.append(f"  Total Transitions to Connected: {mon.tile_counts[tile_idx]}")
         report_lines.append(f"  Total Transitions to Disconnected: {mon.tile_disconnected_counts[tile_idx]}")
-        report_lines.append(f"  ANOMALIES (Other State Detections): {mon.other_detections_by_channel[tile_idx]}")
-        
-        # Average time in each state
-        if video_num in channel_stats:
-            stats = channel_stats[video_num]
-            report_lines.append(f"  Average Time in Each State:")
-            for state_name in ["No Signal", "Scope Disconnected", "Scope Connected", "Other"]:
-                durations = stats.get(state_name, [])
-                if durations:
-                    avg_duration = sum(durations) / len(durations)
-                    total_time = sum(durations)
-                    report_lines.append(f"    {state_name}: {avg_duration:.2f} seconds (avg), {total_time:.2f} seconds (total), {len(durations)} occurrences")
-                else:
-                    report_lines.append(f"    {state_name}: No occurrences")
-        
-        # Transition times for Video 2, 4, 6 (No Signal → Scope Connected)
-        if video_num in [2, 4, 6] and transition_times_246 and video_num in transition_times_246:
-            transition_times = transition_times_246[video_num]
-            if transition_times:
-                report_lines.append(f"  Transition Times (No Signal → Scope Connected):")
-                report_lines.append(f"    Count: {len(transition_times)} transitions")
-                report_lines.append(f"    Min: {min(transition_times):.2f} seconds")
-                report_lines.append(f"    Max: {max(transition_times):.2f} seconds")
-                report_lines.append(f"    Average: {sum(transition_times) / len(transition_times):.2f} seconds")
-                report_lines.append(f"    All times: {', '.join([f'{t:.2f}' for t in transition_times])} seconds")
-            else:
-                report_lines.append(f"  No transitions from No Signal to Scope Connected recorded")
         
         # Parse CSV to get detailed statistics about Scope Disconnected states
         disconnected_data = []
@@ -2638,26 +1856,63 @@ def _generate_and_append_report(channel_stats=None, cycle_counts=None, transitio
         else:
             report_lines.append(f"  No Scope Disconnected events recorded")
         
+        cycle_times = mon.tile_cycle_times[tile_idx]
+        if cycle_times:
+            avg_time = sum(cycle_times) / len(cycle_times)
+            min_time = min(cycle_times)
+            max_time = max(cycle_times)
+            report_lines.append(f"  Reconnection Times (Disconnected→Connected):")
+            report_lines.append(f"    Average: {avg_time:.2f} seconds")
+            report_lines.append(f"    Min: {min_time:.2f} seconds")
+            report_lines.append(f"    Max: {max_time:.2f} seconds")
+            report_lines.append(f"    Count: {len(cycle_times)}")
+            
+            # Identify timing regularities (standard deviation, outliers)
+            if len(cycle_times) > 1:
+                import statistics
+                std_dev = statistics.stdev(cycle_times)
+                report_lines.append(f"    Std Deviation: {std_dev:.2f} seconds")
+                
+                # Flag outliers (> 2 standard deviations from mean)
+                outliers = [t for t in cycle_times if abs(t - avg_time) > 2 * std_dev]
+                if outliers:
+                    report_lines.append(f"    ⚠ Outliers detected: {len(outliers)} reconnections took unusually long/short")
+        else:
+            report_lines.append(f"  No reconnection timing data recorded")
+        
+        # Check for incomplete cycles (stuck in Disconnected state)
+        if mon.tile_disconnected_start[tile_idx] is not None:
+            report_lines.append(f"  ⚠ WARNING: Channel ended in Scope Disconnected state (incomplete cycle)")
     
     report_lines.append("")
     report_lines.append("=" * 80)
-    report_lines.append("ANOMALY DETECTION SUMMARY")
+    report_lines.append("INCOMPLETE CYCLES ANALYSIS")
     report_lines.append("-" * 80)
-    report_lines.append(f"Total 'Other' State Detections (Anomalies): {mon.other_detection_count}")
-    if mon.other_detection_count > 0:
-        report_lines.append("")
-        report_lines.append("Per-Channel Anomaly Counts:")
-        for tile_idx in range(GRID_FEEDS):
-            video_num = TILE_TO_VIDEO[tile_idx]
-            count = mon.other_detections_by_channel[tile_idx]
-            if count > 0:
-                console_serial, scope_id = _get_equipment_for_video(video_num)
-                report_lines.append(f"  Video {video_num} (Console: {console_serial}, Scope: {scope_id}): {count} anomalies")
-        report_lines.append("")
-        report_lines.append("NOTE: All 'Other' state detections are considered anomalies.")
-        report_lines.append("      Screenshots have been saved in the 'captures' folder with 'ANOMALY_' prefix.")
-    else:
-        report_lines.append("No anomalies detected - all states were as expected (No Signal, Scope Disconnected, Scope Connected).")
+    
+    # Analyze state history for incomplete cycles
+    incomplete_found = False
+    for tile_idx in range(GRID_FEEDS):
+        video_num = TILE_TO_VIDEO[tile_idx]
+        history = mon.tile_state_history[tile_idx]
+        
+        # Look for sequences that started Disconnected but didn't reach Connected
+        for i in range(len(history) - 1):
+            if history[i]["state"] == "BARS":
+                # Check if next state is NOT INTERFACE
+                if i + 1 < len(history) and history[i + 1]["state"] != "INTERFACE":
+                    incomplete_found = True
+                    ts = datetime.fromtimestamp(history[i]["timestamp"]).strftime('%H:%M:%S')
+                    next_state = history[i + 1]["state"]
+                    report_lines.append(f"Video {video_num}: Disconnected at {ts} → {label_for(next_state)} (did not reconnect)")
+        
+        # Check if ended in Disconnected
+        if history and history[-1]["state"] == "BARS":
+            incomplete_found = True
+            ts = datetime.fromtimestamp(history[-1]["timestamp"]).strftime('%H:%M:%S')
+            report_lines.append(f"Video {video_num}: Disconnected at {ts} → Test ended (incomplete)")
+    
+    if not incomplete_found:
+        report_lines.append("No incomplete cycles detected.")
     
     report_lines.append("")
     report_lines.append("=" * 80)
@@ -2666,91 +1921,16 @@ def _generate_and_append_report(channel_stats=None, cycle_counts=None, transitio
     
     report_text = "\n".join(report_lines)
     
-    # Analyze CSV data and add summary rows with state counts per channel
+    # Append report to CSV file
     try:
-        # Read existing CSV data
-        rows = []
-        with open(mon.csv_path, 'r', newline='') as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                # Skip rows that are already summary rows or report text
-                if row.get('State', '').startswith('SUMMARY') or row.get('State', '').startswith('='):
-                    continue
-                rows.append(row)
-        
-        # Count states per channel
-        TILE_TO_VIDEO = [1, 3, 5, 2, 4, 6]
-        channel_stats = {}  # video_num -> {state -> count}
-        for video_num in TILE_TO_VIDEO:
-            channel_stats[video_num] = {
-                "No Signal": 0,
-                "Scope Disconnected": 0,
-                "Scope Connected": 0,
-                "Other": 0
-            }
-        
-        for row in rows:
-            video_channel = row.get('Video Channel', '').strip()
-            state = row.get('State', '').strip()
-            if video_channel and state:
-                try:
-                    video_num = int(video_channel)
-                    if video_num in channel_stats and state in channel_stats[video_num]:
-                        channel_stats[video_num][state] += 1
-                except (ValueError, KeyError):
-                    pass
-        
-        # Append summary rows to CSV
         with open(mon.csv_path, "a", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow([])  # Empty row separator
-            writer.writerow(["SUMMARY", "", "", "", "", "", "", "", "", "", "", ""])
-            writer.writerow(["Video Channel", "No Signal", "Scope Disconnected", "Scope Connected", "Other", "Full Cycles", "", "", "", "", "", ""])
-            
-            # Write per-channel summary
-            for tile_idx in range(GRID_FEEDS):
-                video_num = TILE_TO_VIDEO[tile_idx]
-                stats = channel_stats[video_num]
-                full_cycles = cycle_counts.get(video_num, 0) if cycle_counts else 0
-                writer.writerow([
-                    f"Video {video_num}",
-                    stats["No Signal"],
-                    stats["Scope Disconnected"],
-                    stats["Scope Connected"],
-                    stats["Other"],
-                    full_cycles,
-                    "", "", "", "", "", ""
-                ])
-            
-            # Write totals row
-            total_no_signal = sum(s["No Signal"] for s in channel_stats.values())
-            total_disconnected = sum(s["Scope Disconnected"] for s in channel_stats.values())
-            total_connected = sum(s["Scope Connected"] for s in channel_stats.values())
-            total_other = sum(s["Other"] for s in channel_stats.values())
-            total_cycles = sum(cycle_counts.values()) if cycle_counts else 0
-            writer.writerow([
-                "TOTALS",
-                total_no_signal,
-                total_disconnected,
-                total_connected,
-                total_other,
-                total_cycles,
-                "", "", "", "", "", ""
-            ])
-            writer.writerow([])  # Empty row separator
-            
             # Write report as comments/text at end of CSV
             f.write("\n")
             f.write(report_text)
             f.write("\n")
-            f.flush()
-            os.fsync(f.fileno())  # Force write to disk
-        print(f"[Report] Appended summary and report to CSV: {mon.csv_path}")
-        print(f"[Report] CSV file size: {os.path.getsize(mon.csv_path) if os.path.exists(mon.csv_path) else 0} bytes")
+        print(f"[Report] Appended to CSV: {mon.csv_path}")
     except Exception as e:
-        print(f"[Report] Error appending summary/report to CSV: {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"[Report] Error appending to CSV: {e}")
     
     return report_text, mon.csv_path
 
@@ -2920,10 +2100,10 @@ def index():
         <div class='camera-section' style='background:var(--bg);padding:12px;border-radius:8px;margin-bottom:12px;border:1px solid var(--border)'>
           <h3 style='margin-top:0;color:#38bdf8;font-size:14px;margin-bottom:12px'>Camera Source</h3>
           <div style='display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px'>
-        <div class='row'><label>Source</label><input id='src' value='""" + str(mon.src) + """'></div>
-        <div class='row'><label>Backend</label><select id='backend'><option>auto</option><option>MSMF</option><option>DSHOW</option><option>AVFOUNDATION</option><option>V4L2</option></select></div>
-        <div class='row'><label>FOURCC</label><select id='fourcc'><option>auto</option><option>MJPG</option><option>YUY2</option></select></div>
-        <div class='row'><label>Resolution</label><select id='res'><option>1080p</option><option>720p</option></select></div>
+            <div class='row'><label>Source</label><input id='src' value='""" + str(mon.src) + """'></div>
+            <div class='row'><label>Backend</label><select id='backend'><option>auto</option><option>MSMF</option><option>DSHOW</option><option>AVFOUNDATION</option><option>V4L2</option></select></div>
+            <div class='row'><label>FOURCC</label><select id='fourcc'><option>auto</option><option>MJPG</option><option>YUY2</option></select></div>
+            <div class='row'><label>Resolution</label><select id='res'><option>1080p</option><option>720p</option></select></div>
           </div>
         <div style='display:flex;gap:8px;margin-top:8px'>
           <button onclick='connectCamera()' style='flex:1'>Connect to Camera</button>
@@ -2961,12 +2141,8 @@ def index():
               <button onclick='closeReportModal()' style='background:none;border:none;color:var(--muted);font-size:24px;cursor:pointer;padding:0;width:30px;height:30px;display:flex;align-items:center;justify-content:center'>&times;</button>
             </div>
             <pre id='reportText' style='font-size:12px;line-height:1.5;background:var(--bg-secondary);padding:16px;border-radius:8px;overflow-x:auto;white-space:pre-wrap;word-wrap:break-word'></pre>
-            <div id='testFolderLink' style='margin-top:16px;padding:12px;background:var(--panel);border-radius:8px;display:none'>
-              <div style='font-size:12px;color:var(--muted);margin-bottom:8px'>Test Folder:</div>
-              <div id='testFolderPath' style='font-family:monospace;font-size:11px;color:var(--text);word-break:break-all'></div>
-            </div>
             <div style='display:flex;gap:12px;margin-top:20px'>
-              <button onclick='goToCSV()' id='goToCsvBtn' style='flex:1;padding:12px'>Open Test Folder</button>
+              <button onclick='goToCSV()' id='goToCsvBtn' style='flex:1;padding:12px'>Go to CSV/Excel</button>
               <button onclick='closeReportModal()' class='secondary' style='flex:1;padding:12px'>Close</button>
             </div>
           </div>
@@ -3067,7 +2243,7 @@ def index():
       let r;
       try {
         r = await fetch('/start_detection', { 
-      method: 'POST',
+          method: 'POST',
           signal: controller.signal
         });
         clearTimeout(timeoutId);
@@ -3190,19 +2366,8 @@ def index():
         indicator.style.opacity = '0';
       }
       
-      // Show post-processing message
-      const statusMsg = document.createElement('div');
-      statusMsg.id = 'postProcessStatus';
-      statusMsg.style.cssText = 'position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);background:var(--panel);border:2px solid var(--border);border-radius:12px;padding:24px;z-index:10000;min-width:300px;text-align:center;box-shadow:0 4px 20px rgba(0,0,0,0.5)';
-      statusMsg.innerHTML = '<div style="font-size:16px;color:var(--text);margin-bottom:12px">Test Ended</div><div style="font-size:14px;color:var(--muted)">Post-processing CSV and creating XLSX file...</div><div style="margin-top:16px;font-size:12px;color:var(--muted)">Please wait...</div>';
-      document.body.appendChild(statusMsg);
-      
       console.log('Calling /end_test endpoint...');
       const r = await fetch('/end_test', {method: 'POST'});
-      
-      // Remove status message
-      const statusEl = document.getElementById('postProcessStatus');
-      if (statusEl) statusEl.remove();
       
       console.log('End test response status:', r.status, r.statusText);
       
@@ -3216,34 +2381,16 @@ def index():
       const j = await r.json();
       console.log('End test response:', j);
       
-      if (!j.ok) {
-        alert('Error: ' + (j.error || 'Unknown error'));
-        return;
-      }
-      
       if (j.report) {
         // Display the report in modal
         const reportTextEl = document.getElementById('reportText');
         const reportModalEl = document.getElementById('reportModal');
-        const testFolderLink = document.getElementById('testFolderLink');
-        const testFolderPath = document.getElementById('testFolderPath');
         
         if (reportTextEl && reportModalEl) {
           reportTextEl.textContent = j.report;
-          
-          // Show test folder link if available
-          if (j.test_folder && testFolderLink && testFolderPath) {
-            testFolderPath.textContent = j.test_folder;
-            testFolderLink.style.display = 'block';
-          } else if (testFolderLink) {
-            testFolderLink.style.display = 'none';
-          }
-          
           reportModalEl.style.display = 'block';
           
           console.log('Report displayed in modal, length:', j.report.length);
-          console.log('Test folder:', j.test_folder);
-          console.log('Data rows:', j.data_rows);
         } else {
           console.error('Report elements not found in DOM');
         }
@@ -3254,32 +2401,16 @@ def index():
         }
       }
     } catch(e) {
-      // Remove status message on error
-      const statusEl = document.getElementById('postProcessStatus');
-      if (statusEl) statusEl.remove();
-      
       console.error('Error ending test:', e);
       alert('Exception ending test: ' + e.message);
       // Still stop indicator on error
-      const indicator = document.getElementById('testIndicator');
-      if (indicator) indicator.classList.remove('running');
+      document.getElementById('testIndicator').classList.remove('running');
     }
   }
 
   async function goToCSV(){
     try {
-      // Get test folder from report modal or use reveal_csv endpoint
-      const testFolderPath = document.getElementById('testFolderPath');
-      if (testFolderPath && testFolderPath.textContent) {
-        // Open the test folder directly
-        const folder = testFolderPath.textContent.trim();
-        if (folder) {
-          // Use reveal_csv endpoint which will open the folder
-          await fetch('/reveal_csv', {method: 'POST'});
-        }
-      } else {
-        await fetch('/reveal_csv', {method: 'POST'});
-      }
+      await fetch('/reveal_csv', {method: 'POST'});
     } catch(e) {
       console.error('Error opening CSV folder:', e);
     }
@@ -3952,8 +3083,6 @@ def _annotated_grid_from_frame(bgr):
         dmean      = mon.dark_mean
         dstd       = mon.dark_std
         margin     = mon.margin
-        st         = mon.stable_frames
-        hold_ms    = mon.hold_ms
 
     if bars_h_roi is None or not int_h_list:
         try:
@@ -3984,7 +3113,6 @@ def _annotated_grid_from_frame(bgr):
 
     tiles_out = []
     for idx, (tile, (x, y, w, h)) in enumerate(zip(tiles, rects), start=1):
-        capture_timestamp = None  # Track anomaly capture timing for this tile
         det, db, di, _cg, mean_l, std_l, roi_mean, roi_bright, bright_ok, white_frac_gray, white_frac_rgb = decide(
             tile, bars_h_roi, int_h_list, cw, thr, dmean, dstd, margin, ref_mean, ref_bright,
             white_frac_override=getattr(mon, "white_frac_gate", None),
@@ -3995,87 +3123,108 @@ def _annotated_grid_from_frame(bgr):
         except Exception:
             discnt_val = 0
         tiles_out.append({"det": det, "db": int(db), "di": int(di), "cnt": int(mon.tile_counts[idx-1]), "discnt": discnt_val})
-        # --- Per-tile transition tracking and CSV logging with stabilization ---
+        # --- Per-tile transition tracking and CSV logging ---
         try:
             tile_idx0 = idx - 1
             prev = mon.tile_last[tile_idx0]
             TILE_TO_VIDEO = [1, 3, 5, 2, 4, 6]
             video_num = TILE_TO_VIDEO[tile_idx0]
             
-            # Add stabilization tracking per tile (similar to main loop)
-            # Track raw detection stability
-            if det == mon.tile_raw_last[tile_idx0]:
-                mon.tile_raw_stable[tile_idx0] += 1
-            else:
-                mon.tile_raw_last[tile_idx0] = det
-                mon.tile_raw_stable[tile_idx0] = 1
-            
-            # Track state changes only after stabilization (same logic as main loop)
+            # Track state changes
             if det != prev:
-                # Apply same hysteresis logic as main loop
-                det_ok = False
+                # Record state history
+                mon.tile_state_history[tile_idx0].append({
+                    "state": det,
+                    "timestamp": time.time()
+                })
+                
+                # Calculate elapsed time from test start
+                elapsed_from_test_start = None
+                if mon.test_start_time:
+                    elapsed_from_test_start = (time.time() - mon.test_start_time.timestamp())
+                
+                # Track timing for Disconnected → Connected transitions
                 if det == "BARS":
-                    det_ok = (db < (thr + margin))
+                    # Mark start of Scope Disconnected period
+                    # Don't increment count yet - wait to see if next state is NO_SIGNAL
+                    mon.tile_disconnected_start[tile_idx0] = time.time()
+                    
+                    # Check if we entered BARS from NO_SIGNAL (potential partial cycle)
+                    if prev == "NO_SIGNAL":
+                        mon.tile_in_partial_cycle[tile_idx0] = True
+                    
+                    # Log Scope Disconnected with elapsed time and current cycle number
+                    _csv_append(video_num, det, 
+                               elapsed_secs=elapsed_from_test_start,
+                               cycle_num=mon.tile_complete_cycles[tile_idx0],
+                               partial_cycle_num=None,
+                               bars_dist=int(db), int_dist=int(di))
+                    
                 elif det == "INTERFACE":
-                    det_ok = (di < (thr + margin)) or bright_ok
-                else:
-                    det_ok = True  # OTHER/NO_SIGNAL has no phash gate
-                
-                now_ts = time.time()
-                long_enough = (now_ts - mon.tile_last_change_ts[tile_idx0]) * 1000.0 >= hold_ms
-                
-                # Only log if stable enough AND passes gate AND enough time has passed
-                if (mon.tile_raw_stable[tile_idx0] >= st and det_ok and long_enough):
-                    # Record state history
-                    mon.tile_state_history[tile_idx0].append({
-                        "state": det,
-                        "timestamp": now_ts
-                    })
+                    # Scope Connected - increment cycle number FIRST
+                    mon.tile_complete_cycles[tile_idx0] += 1
                     
-                    # Update tile_last to the new stable state
-                    mon.tile_last[tile_idx0] = det
-                    mon.tile_last_change_ts[tile_idx0] = now_ts
+                    # If we were in a partial cycle but went to INTERFACE instead of NO_SIGNAL, cancel the partial cycle
+                    if mon.tile_in_partial_cycle[tile_idx0]:
+                        mon.tile_in_partial_cycle[tile_idx0] = False
                     
-                    # Log state change (elapsed time and cycle counts will be calculated during post-processing)
-                    if det == "BARS":
-                        # Log Scope Disconnected
-                        _csv_append(video_num, det, 
-                                   bars_dist=int(db), int_dist=int(di),
-                                   other_count=mon.other_detections_by_channel[tile_idx0])
-                        
-                    elif det == "INTERFACE":
-                        mon.tile_counts[tile_idx0] += 1
-                        # Log Scope Connected
-                        _csv_append(video_num, det, 
-                                   bars_dist=int(db), int_dist=int(di),
-                                   other_count=mon.other_detections_by_channel[tile_idx0])
-                        
-                    elif det == "NO_SIGNAL":
-                        # Only increment disconnected count if we're transitioning FROM BARS to NO_SIGNAL
-                        if prev == "BARS":
-                            mon.tile_disconnected_counts[tile_idx0] += 1
-                        
-                        # Log No Signal
-                        _csv_append(video_num, det,
-                                   bars_dist=int(db), int_dist=int(di),
-                                   other_count=mon.other_detections_by_channel[tile_idx0])
-                        
-                    else:  # OTHER (ANOMALY)
-                        # Track "Other" as an anomaly
-                        mon.other_detection_count += 1
-                        mon.other_detections_by_channel[tile_idx0] += 1
-                        capture_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                        
-                        # Log Other state (marked as anomaly in event_type)
-                        # Note: other_detections_by_channel was already incremented above
-                        _csv_append(video_num, det,
-                                   other_count=mon.other_detections_by_channel[tile_idx0],
-                                   bars_dist=int(db), int_dist=int(di),
-                                   event_type="anomaly")
+                    # Calculate elapsed time if coming from Disconnected (for reconnection timing)
+                    reconnection_elapsed = None
+                    if mon.tile_disconnected_start[tile_idx0] is not None:
+                        reconnection_elapsed = time.time() - mon.tile_disconnected_start[tile_idx0]
+                        mon.tile_cycle_times[tile_idx0].append(reconnection_elapsed)
+                        mon.tile_disconnected_start[tile_idx0] = None
+                    
+                    mon.tile_counts[tile_idx0] += 1
+                    
+                    # Log Scope Connected with elapsed time from test start and cycle number
+                    _csv_append(video_num, det, 
+                               elapsed_secs=elapsed_from_test_start,
+                               cycle_num=mon.tile_complete_cycles[tile_idx0],
+                               partial_cycle_num=None,
+                               bars_dist=int(db), int_dist=int(di))
+                    
+                elif det == "NO_SIGNAL":
+                    # Check for partial cycle completion: NO_SIGNAL → BARS → NO_SIGNAL
+                    partial_cycle_count = None
+                    if prev == "BARS" and mon.tile_in_partial_cycle[tile_idx0]:
+                        # Complete partial cycle detected: NO_SIGNAL → BARS → NO_SIGNAL
+                        mon.tile_partial_cycles[tile_idx0] += 1
+                        partial_cycle_count = mon.tile_partial_cycles[tile_idx0]
+                        mon.tile_in_partial_cycle[tile_idx0] = False
+                    
+                    # Only increment disconnected count if we're transitioning FROM BARS to NO_SIGNAL
+                    # This means the scope was disconnected and went to no signal (complete disconnect cycle)
+                    # If it went BARS → INTERFACE, that's a normal cycle, not a disconnect
+                    if prev == "BARS":
+                        mon.tile_disconnected_counts[tile_idx0] += 1
+                        # Clear the disconnected start time since we've completed the disconnect cycle
+                        if mon.tile_disconnected_start[tile_idx0] is not None:
+                            mon.tile_disconnected_start[tile_idx0] = None
+                    
+                    # Log NO_SIGNAL - no elapsed_secs, but include partial_cycle_count if this completes a partial cycle
+                    _csv_append(video_num, det, 
+                               elapsed_secs=None,  # Don't log elapsed_secs for NO_SIGNAL
+                               cycle_num=None,
+                               partial_cycle_num=partial_cycle_count,
+                               bars_dist=int(db), int_dist=int(di))
+                    
+                else:  # OTHER
+                    # If we were in a partial cycle but went to OTHER, cancel the partial cycle
+                    if mon.tile_in_partial_cycle[tile_idx0]:
+                        mon.tile_in_partial_cycle[tile_idx0] = False
+                    
+                    # Don't log any values (elapsed_secs, cycle_num, partial_cycle_num) for OTHER state
+                    _csv_append(video_num, det, 
+                               elapsed_secs=None,  # No elapsed_secs for OTHER
+                               cycle_num=None,  # No cycle_num for OTHER
+                               partial_cycle_num=None,  # No partial_cycle_num for OTHER
+                               bars_dist=int(db), int_dist=int(di))
+                
+                mon.tile_last[tile_idx0] = det
         except Exception as e:
-            print(f"[annotate_grid] Error processing tile {idx}: {e}")
-            import traceback
-            traceback.print_exc()
+            print(f"[Tile tracking] Error: {e}")
+            pass
         if det == "INTERFACE":
             color, text = C_OK, "Scope Connected"
         elif det == "BARS":
@@ -4087,20 +3236,6 @@ def _annotated_grid_from_frame(bgr):
 
         # draw status badge inside tile
         _ = draw_status_badge(out, x + 10, y + 10, text, color)
-
-        # After overlays, capture anomaly screenshots so badges/labels are visible
-        if capture_timestamp and mon.test_folder_path and mon.detection_active:
-            try:
-                captures_folder = os.path.join(mon.test_folder_path, "captures")
-                os.makedirs(captures_folder, exist_ok=True)
-                full_path = os.path.join(captures_folder, f"ANOMALY_vid{video_num}_{capture_timestamp}_full.png")
-                crop_path = os.path.join(captures_folder, f"ANOMALY_vid{video_num}_{capture_timestamp}_crop.png")
-                tile_with_overlay = out[y:y + h, x:x + w].copy()
-                cv2.imwrite(full_path, out)
-                cv2.imwrite(crop_path, tile_with_overlay)
-                print(f"[annotate_grid] ANOMALY captured (Video {video_num}): {crop_path}, {full_path}")
-            except Exception as e:
-                print(f"[annotate_grid] Error capturing 'Other' screenshot: {e}")
 
         # --- Debug overlay: show parameters and measured ROI values ---
         try:
@@ -4148,28 +3283,28 @@ def _annotated_grid_from_frame(bgr):
         except Exception:
             pass
 
-    # Cache the detections snapshot and the annotated frame for UI consistency
+    # Cache the detections snapshot for UI consistency (used by /grid_status)
     try:
         with mon.lock:
             mon.last_grid = {"ts": time.time(), "tiles": tiles_out}
-            mon.last_annotated = out.copy()
     except Exception:
         pass
-    
-    # Periodic snapshots removed - we only log actual state changes now
 
     return out
 
 @app.get("/thumb")
 def thumb():
     with mon.lock:
-        annotated = mon.last_annotated.copy() if mon.last_annotated is not None else None
-        frame = mon.last_frame.copy() if mon.last_frame is not None else None
+        frame = mon.last_frame
 
-    if annotated is not None:
-        img = annotated
-    elif frame is not None:
-        img = _composite_thumb_from_frame(frame)
+    if frame is not None:
+        try:
+            # Annotate the live 3x2 grid with per‑tile status/labels
+            annotated = _annotated_grid_from_frame(frame)
+            img = annotated
+        except Exception:
+            # fall back to simple composite if annotation fails
+            img = _composite_thumb_from_frame(frame)
     else:
         img = _placeholder_thumb(1200, 675)
 
@@ -4551,148 +3686,6 @@ def identify_camera_type(cap, idx):
                 
     except Exception:
         return "unknown"
-
-def get_directshow_camera_names():
-    """
-    Get DirectShow camera names using pygrabber (like Zoom does).
-    Returns: dict mapping index to camera name, or empty dict if not available.
-    """
-    if platform.system() != "Windows":
-        return {}
-    
-    try:
-        from pygrabber.dshow_graph import FilterGraph
-        graph = FilterGraph()
-        devices = graph.get_input_devices()
-        # Create mapping: index -> name
-        name_map = {}
-        for i, device_name in enumerate(devices):
-            name_map[i] = device_name
-        return name_map
-    except ImportError:
-        # pygrabber not installed, can't get names
-        return {}
-    except Exception as e:
-        print(f"[get_directshow_camera_names] Error getting camera names: {e}")
-        return {}
-
-def find_obs_virtual_camera():
-    """
-    Scan for OBS Virtual Camera by NAME first (like Zoom does), then by index/resolution.
-    Returns: (index, True) if found, (None, False) if not found
-    """
-    if platform.system() != "Windows":
-        return None, False
-    
-    print("[find_obs_virtual_camera] Scanning for OBS Virtual Camera...")
-    
-    # Check if OBS is running first - OBS Virtual Camera only exists when OBS is running
-    obs_running = False
-    try:
-        result = subprocess.run(['tasklist', '/FI', 'IMAGENAME eq obs64.exe'], 
-                              capture_output=True, timeout=1)
-        obs_running = result.returncode == 0 and b'obs64.exe' in result.stdout
-    except:
-        pass
-    
-    if not obs_running:
-        print("[find_obs_virtual_camera] OBS not running - OBS Virtual Camera won't exist")
-        return None, False
-    
-    # METHOD 1: Try to find by NAME (like Zoom does) - this is the most reliable
-    print("[find_obs_virtual_camera] Method 1: Searching by camera name (like Zoom)...")
-    camera_names = get_directshow_camera_names()
-    if camera_names:
-        for idx, name in camera_names.items():
-            name_lower = name.lower()
-            # Look for "OBS Virtual Camera" or "OBS-Camera" in the name
-            if "obs" in name_lower and ("virtual" in name_lower or "camera" in name_lower):
-                print(f"[find_obs_virtual_camera] Found camera with OBS in name at index {idx}: '{name}'")
-                # Verify it works
-                cap = None
-                try:
-                    cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
-                    if cap and cap.isOpened():
-                        try:
-                            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
-                            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
-                            cap.set(cv2.CAP_PROP_FPS, 30)
-                            ret, frame = cap.read()
-                            if ret and frame is not None:
-                                h, w = frame.shape[:2]
-                                if w == 1920 and h == 1080:
-                                    cap.release()
-                                    print(f"[find_obs_virtual_camera] ✓ Verified OBS Virtual Camera at index {idx} (1920x1080, DSHOW)")
-                                    return idx, True
-                        except:
-                            pass
-                        cap.release()
-                except:
-                    if cap:
-                        try:
-                            cap.release()
-                        except:
-                            pass
-                print(f"[find_obs_virtual_camera] ⚠ Found by name but verification failed, continuing search...")
-    
-    # METHOD 2: Fallback to index/resolution search (original method)
-    print("[find_obs_virtual_camera] Method 2: Searching by index and resolution (1920x1080, DSHOW)...")
-    
-    # Try all indices 0-10. Index 0 might be OBS Virtual Camera OR HDMI capture device,
-    # but we'll verify by checking if it outputs 1920x1080.
-    indices_to_check = [0, 1, 2, 3] + [i for i in range(4, 11)]  # Try 0-3 first, then 4-10
-    print(f"[find_obs_virtual_camera] Checking indices: {indices_to_check}")
-    
-    # Scan indices with DSHOW backend (matching obs.py approach: set resolution, then verify)
-    for idx in indices_to_check:
-        cap = None
-        try:
-            cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
-            if cap and cap.isOpened():
-                # Set buffer size first (helps with real-time reading)
-                try:
-                    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                except:
-                    pass
-                
-                # Set resolution to 1920x1080 (like obs.py does - don't check native first)
-                try:
-                    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
-                    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
-                    cap.set(cv2.CAP_PROP_FPS, 30)
-                except:
-                    pass
-                
-                # Read a frame to verify it works at 1920x1080
-                ret, frame = cap.read()
-                if ret and frame is not None:
-                    h, w = frame.shape[:2]
-                    # If it's 1920x1080, this is likely OBS Virtual Camera
-                    if w == 1920 and h == 1080:
-                        cap.release()
-                        print(f"[find_obs_virtual_camera] ✓ Found OBS Virtual Camera at index {idx} (1920x1080, DSHOW)")
-                        return idx, True
-                    else:
-                        # Not 1920x1080, release and continue
-                        cap.release()
-                        continue
-                else:
-                    cap.release()
-                    continue
-            else:
-                if cap:
-                    cap.release()
-        except Exception as e:
-            if cap:
-                try:
-                    cap.release()
-                except:
-                    pass
-            continue
-    
-    print("[find_obs_virtual_camera] ⚠ OBS Virtual Camera not found (no 1920x1080 DSHOW camera)")
-    return None, False
 
 def reset_camera_system():
     """Reset the camera system to recover from failed connections."""
@@ -5611,8 +4604,6 @@ def update_camera_settings():
 def start_video():
     """Start or restart video feed with current camera settings."""
     try:
-        import time
-        
         # Stop existing video if running
         with mon.lock:
             if mon.video_running:
@@ -5620,15 +4611,10 @@ def start_video():
                 mon.video_running = False
                 mon.detection_active = False
                 mon.running = False
-        
-        # Wait for existing thread to finish (outside the lock to avoid deadlock)
-        if hasattr(mon, 'worker') and mon.worker is not None and mon.worker.is_alive():
-            print(f"[start_video] Waiting for existing worker thread to stop...")
-            mon.worker.join(timeout=2.0)  # Wait up to 2 seconds
-            if mon.worker.is_alive():
-                print(f"[start_video] WARNING: Worker thread did not stop cleanly, proceeding anyway")
-        
-        with mon.lock:
+                # Wait a bit for the thread to stop
+                import time
+                time.sleep(0.5)
+            
             mon.last_cfg = {}
             mon.video_running = True
             mon.detection_active = False
@@ -5641,14 +4627,11 @@ def start_video():
         t = threading.Thread(target=run_loop, daemon=True)
         mon.worker = t
         t.start()
-        print(f"[start_video] Video thread started (thread id: {t.ident})")
         # Return current source and backend so UI can update
         return jsonify(ok=True, src=mon.src, backend=mon.backend_name)
         
     except Exception as e:
         print(f"[start_video] ERROR: {e}")
-        import traceback
-        traceback.print_exc()
         with mon.lock:
             mon.video_running = False
             mon.detection_active = False
@@ -5720,222 +4703,63 @@ def start_detection():
     
     # Do I/O operations outside the lock to prevent blocking
     try:
-        # Validate CSV path before attempting to create
-        if not csv_path:
-            raise ValueError("CSV path is empty")
-        
-        # Normalize path for Windows (handle network drives and spaces)
-        csv_path = os.path.normpath(csv_path)
-        
-        # Ensure parent directory exists and is accessible
-        csv_dir = os.path.dirname(csv_path)
-        if csv_dir:
-            try:
-                os.makedirs(csv_dir, exist_ok=True)
-                # Verify directory was actually created
-                if not os.path.exists(csv_dir):
-                    raise OSError(f"Directory was not created: {csv_dir}")
-                # Check write permission
-                if not os.access(csv_dir, os.W_OK):
-                    raise PermissionError(f"No write permission to directory: {csv_dir}")
-            except Exception as dir_err:
-                error_msg = f"Cannot create or access directory {csv_dir}: {dir_err}"
-                print(f"[Start Test] {error_msg}")
-                raise Exception(error_msg) from dir_err
-        
-        print(f"[Start Test] Creating CSV at: {csv_path}")
-        print(f"[Start Test] CSV directory: {csv_dir if csv_dir else '(current directory)'}")
-        print(f"[Start Test] Directory exists: {os.path.exists(csv_dir) if csv_dir else 'N/A'}")
-        print(f"[Start Test] Directory writable: {os.access(csv_dir, os.W_OK) if csv_dir and os.path.exists(csv_dir) else 'N/A'}")
-        
         # Create CSV file with headers immediately when Start Test is pressed
         f, w = open_csv(csv_path)
         f.close()
-        
-        # Verify CSV file was created and is accessible
-        if not os.path.exists(csv_path):
-            raise FileNotFoundError(f"CSV file was not created at: {csv_path}")
-        
-        csv_size = os.path.getsize(csv_path)
         print(f"[Start Test] Created CSV with headers: {csv_path}")
-        print(f"[Start Test] CSV file size: {csv_size} bytes")
-        
-        if csv_size == 0:
-            print("[Start Test] WARNING: CSV file is empty after creation!")
-        
-        # Verify we can read the CSV
-        try:
-            with open(csv_path, 'r', encoding='utf-8') as verify_f:
-                first_line = verify_f.readline()
-                if not first_line:
-                    raise ValueError("CSV file appears to be empty")
-                print(f"[Start Test] CSV header line: {first_line.strip()}")
-        except Exception as verify_err:
-            print(f"[Start Test] WARNING: Could not verify CSV file: {verify_err}")
     except Exception as e:
-        import traceback
-        error_detail = traceback.format_exc()
         print(f"[Start Test] Error creating CSV: {e}")
-        print(f"[Start Test] Error details: {error_detail}")
-        print(f"[Start Test] CSV path that failed: {csv_path}")
         with mon.lock:
             mon.detection_active = False
-        return jsonify(ok=False, error=f"Failed to create CSV: {e}", path=csv_path), 500
+        return jsonify(ok=False, error=f"Failed to create CSV: {e}"), 500
     
-    # Return response immediately so frontend can update UI (testing indicator, timer, etc.)
-    with mon.lock:
-        detection_active = mon.detection_active
-        status = mon.status
-    
-    # Log initial "No Signal" state for all 6 channels in background thread
+    # Log initial "No Signal" state for all 6 channels (outside lock)
     # This ensures the first entry is always "No Signal" for proper elapsed time calculations
-    def log_initial_states():
-        try:
-            TILE_TO_VIDEO = [1, 3, 5, 2, 4, 6]  # Map tile indices to video numbers
-            # Get other_count values while holding lock, then release before calling _csv_append
-            with mon.lock:
-                other_counts = [mon.other_detections_by_channel[tile_idx0] for tile_idx0 in range(len(TILE_TO_VIDEO))]
-            
-            # Now call _csv_append without holding the lock (it acquires its own lock)
-            for tile_idx0, video_num in enumerate(TILE_TO_VIDEO):
-                _csv_append(
-                    video=video_num,
-                    state="NO_SIGNAL",
-                    bars_dist=None,
-                    int_dist=None,
-                    other_count=other_counts[tile_idx0],
-                    event_type="test_start"
-                )
-            print(f"[Start Test] Logged initial 'No Signal' state for all 6 channels")
-        except Exception as e:
-            print(f"[Start Test] Warning: Error logging initial No Signal states: {e}")
+    TILE_TO_VIDEO = [1, 3, 5, 2, 4, 6]  # Map tile indices to video numbers
+    try:
+        for video_num in TILE_TO_VIDEO:
+            _csv_append(
+                video=video_num,
+                state="NO_SIGNAL",
+                elapsed_secs=None,  # No elapsed time for initial state (and NO_SIGNAL never has elapsed_secs)
+                cycle_num=None,
+                partial_cycle_num=None,
+                bars_dist=None,
+                int_dist=None,
+                event_type="test_start"
+            )
+        print(f"[Start Test] Logged initial 'No Signal' state for all 6 channels")
+    except Exception as e:
+        print(f"[Start Test] Warning: Error logging initial No Signal states: {e}")
     
-    # Start background thread for initial logging (non-blocking)
-    threading.Thread(target=log_initial_states, daemon=True).start()
+    # Verify detection_active is still True before returning
+    with mon.lock:
+        print(f"[Start Test] Returning response: detection_active={mon.detection_active}, csv_path={csv_path}")
+        detection_active = mon.detection_active
     
-    print(f"[Start Test] Returning response immediately: detection_active={detection_active}, status={status}, csv_path={csv_path}")
-    return jsonify(ok=True, csv_path=csv_path, detection_active=detection_active, status=status)
+    return jsonify(ok=True, csv_path=csv_path, detection_active=detection_active)
 
 @app.post("/end_test")
 def end_test():
     """End the test, recalculate elapsed times, generate report, and append to CSV."""
     with mon.lock:
         mon.detection_active = False
-        mon.status = "post_processing"
-        csv_path = mon.csv_path
-        test_folder_path = mon.test_folder_path
+        mon.status = "generating_report"
     
-    # Check if CSV path is set before attempting post-processing
-    if not csv_path:
-        error_msg = "CSV path is not set. Please click 'Start Test' first to begin a test."
-        print(f"[End Test] ERROR: {error_msg}")
-        print(f"[End Test] This usually means 'Start Test' was never clicked.")
-        return jsonify(ok=False, error=error_msg)
-    
-    # Check if CSV file exists
-    csv_path_norm = os.path.normpath(csv_path)
-    if not os.path.exists(csv_path_norm):
-        error_msg = f"CSV file not found at: {csv_path_norm}. Please click 'Start Test' first to create the CSV file."
-        print(f"[End Test] ERROR: {error_msg}")
-        print(f"[End Test] CSV path: {csv_path_norm}")
-        print(f"[End Test] File exists: {os.path.exists(csv_path_norm)}")
-        print(f"[End Test] Parent directory: {os.path.dirname(csv_path_norm)}")
-        print(f"[End Test] Parent exists: {os.path.exists(os.path.dirname(csv_path_norm)) if os.path.dirname(csv_path_norm) else 'N/A'}")
-        return jsonify(ok=False, error=error_msg)
-    
-    # Post-process: Calculate elapsed times (duration of each state) and cycle counts
+    # Post-process: Recalculate elapsed times from previous No Signal for each channel
     try:
-        print("[End Test] Post-processing CSV (calculating elapsed times and cycle counts)...")
-        print(f"[End Test] CSV file: {csv_path_norm}")
-        processed_rows, channel_stats, cycle_counts, partial_cycle_counts, transition_times_246 = _post_process_csv()
-        if processed_rows is None:
-            error_msg = "Post-processing returned no data. The CSV file may be empty or invalid."
-            print(f"[End Test] ERROR: {error_msg}")
-            print(f"[End Test] CSV file size: {os.path.getsize(csv_path_norm) if os.path.exists(csv_path_norm) else 0} bytes")
-            return jsonify(ok=False, error=error_msg)
+        print("[End Test] Recalculating elapsed times from No Signal...")
+        _recalculate_elapsed_times_from_no_signal()
     except Exception as e:
-        error_msg = f"Error post-processing CSV: {e}"
-        print(f"[End Test] ERROR: {error_msg}")
-        import traceback
-        traceback.print_exc()
-        return jsonify(ok=False, error=error_msg)
+        print(f"[End Test] Warning: Error recalculating elapsed times: {e}")
     
-    # Generate report and append to CSV (pass statistics from post-processing)
-    # This MUST happen before Excel creation so CSV has all data + report
+    # Generate report and append to CSV
     try:
-        with mon.lock:
-            mon.status = "generating_report"
-        report_text, csv_path = _generate_and_append_report(channel_stats=channel_stats, cycle_counts=cycle_counts, transition_times_246=transition_times_246)
+        report_text, csv_path = _generate_and_append_report()
         print("\n" + report_text)  # Print to console
-        print(f"[End Test] Report generated and appended to CSV successfully, {len(report_text)} chars")
+        print(f"[End Test] Report generated successfully, {len(report_text)} chars")
         
-        # Verify CSV has data before creating Excel
-        if not os.path.exists(csv_path):
-            return jsonify(ok=False, error=f"CSV file not found after report generation: {csv_path}")
-        
-        # Small delay to ensure file system has synced
-        import time
-        time.sleep(0.1)
-        
-        # Count data rows in CSV to verify
-        data_row_count = 0
-        try:
-            with open(csv_path, 'r', newline='', encoding='utf-8') as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    if row.get('Video Channel') and row.get('State') and not row.get('State', '').startswith('SUMMARY') and not row.get('State', '').startswith('='):
-                        data_row_count += 1
-            print(f"[End Test] CSV contains {data_row_count} data rows")
-        except Exception as count_err:
-            print(f"[End Test] Warning: Error counting CSV rows: {count_err}")
-            data_row_count = 0
-        
-        # Create Excel file from CSV (with formatting, filters, and conditional formatting)
-        # This must happen AFTER report is appended to CSV
-        try:
-            with mon.lock:
-                mon.status = "creating_excel"
-            print("[End Test] Creating Excel file from CSV...")
-            excel_path = _create_excel_from_csv(csv_path)
-            if excel_path and os.path.exists(excel_path):
-                print(f"[End Test] Excel file created successfully: {excel_path}")
-            else:
-                print("[End Test] Warning: Excel file creation failed or file not found")
-                excel_path = None
-        except Exception as excel_err:
-            print(f"[End Test] Error creating Excel file: {excel_err}")
-            import traceback
-            traceback.print_exc()
-            excel_path = None
-        
-        # Save log file to test folder after post-processing completes
-        try:
-            with mon.lock:
-                log_file_path = mon.log_file_path
-                test_folder = mon.test_folder_path
-            
-            if log_file_path and test_folder:
-                print(f"[End Test] Saving log file to test folder...")
-                _save_log_to_file(log_file_path)
-                print(f"[End Test] Log file saved: {log_file_path}")
-            else:
-                print(f"[End Test] Warning: Log file path not set (log_file_path={log_file_path}, test_folder={test_folder})")
-        except Exception as log_err:
-            print(f"[End Test] Error saving log file: {log_err}")
-            import traceback
-            traceback.print_exc()
-        
-        # Get test folder path for UI link
-        test_folder = test_folder_path if test_folder_path else os.path.dirname(csv_path)
-        
-        return jsonify(
-            ok=True, 
-            report=report_text, 
-            csv_path=csv_path, 
-            excel_path=excel_path,
-            test_folder=test_folder,
-            data_rows=data_row_count
-        )
+        return jsonify(ok=True, report=report_text, csv_path=csv_path)
     except Exception as e:
         import traceback
         error_detail = traceback.format_exc()
@@ -5945,48 +4769,24 @@ def end_test():
 
 @app.post("/reveal_csv")
 def reveal_csv():
-    """Open the file browser and reveal the test folder containing CSV and Excel files."""
+    """Open the file browser and highlight the most recent CSV and Excel files."""
     try:
-        # Get the current CSV path and test folder
+        # Get the current CSV path
         with mon.lock:
             csv_path = mon.csv_path
-            test_folder_path = mon.test_folder_path
         
-        # Use test folder if available, otherwise use CSV directory
-        folder_to_open = test_folder_path if test_folder_path else os.path.dirname(csv_path)
-        folder_to_open = os.path.normpath(folder_to_open)
+        # Reveal CSV in file browser
+        success_csv = _reveal_in_file_browser(csv_path)
         
-        if not os.path.exists(folder_to_open):
-            return jsonify(ok=False, error=f"Test folder not found: {folder_to_open}")
+        # Also reveal Excel file if it exists
+        excel_path = _get_excel_path(csv_path)
+        success_excel = False
+        if EXCEL_AVAILABLE and os.path.exists(excel_path):
+            success_excel = _reveal_in_file_browser(excel_path)
         
-        # Open the folder (not individual files)
-        try:
-            if platform.system() == "Darwin":  # macOS
-                subprocess.run(["open", folder_to_open], check=False)
-            elif platform.system() == "Windows":
-                subprocess.run(["explorer", folder_to_open], check=False)
-            else:  # Linux
-                subprocess.run(["xdg-open", folder_to_open], check=False)
-            print(f"[Reveal CSV] Opened test folder: {folder_to_open}")
-        except Exception as e:
-            print(f"[Reveal CSV] Error opening folder: {e}")
-            return jsonify(ok=False, error=f"Error opening folder: {e}")
-        
-        # Also check if Excel file exists
-        excel_path = _get_excel_path(csv_path) if csv_path else None
-        excel_exists = excel_path and os.path.exists(excel_path) if excel_path else False
-        
-        return jsonify(
-            ok=True, 
-            success=True, 
-            csv_path=csv_path, 
-            excel_path=excel_path if excel_exists else None,
-            test_folder=folder_to_open
-        )
+        return jsonify(ok=True, success=success_csv, csv_path=csv_path, excel_path=excel_path if success_excel else None)
     except Exception as e:
         print(f"[Reveal CSV] Error: {e}")
-        import traceback
-        traceback.print_exc()
         return jsonify(ok=False, error=str(e))
 
 @app.post("/clear")
@@ -6043,171 +4843,89 @@ def open_browser():
 
 # ---- main launcher ----
 if __name__ == "__main__":
-    try:
-        # Log computer name and system information at startup
+    # Auto-detect and connect to camera on startup (non-blocking with timeout)
+    def auto_connect_camera():
+        """Auto-connect to camera in background thread - using obs.py method for Windows/OBS."""
         try:
-            computer_name = socket.gethostname()
-            system_name = platform.system()
-            system_release = platform.release()
-            system_version = platform.version()
-            machine = platform.machine()
-            processor = platform.processor()
+            import time
+            # Small delay to ensure server is fully started
+            time.sleep(0.5)
+            print("[Startup] Auto-connecting to camera...")
             
-            print("=" * 80)
-            print("BOOT CYCLE LOGGER - STARTUP")
-            print("=" * 80)
-            print(f"Computer Name: {computer_name}")
-            print(f"Operating System: {system_name} {system_release} {system_version}")
-            print(f"Machine: {machine}")
-            if processor:
-                print(f"Processor: {processor}")
-            print(f"Python Version: {sys.version.split()[0]} ({sys.version.split()[1]})")
-            print(f"Python Executable: {sys.executable}")
-            print("=" * 80)
-        except Exception as e:
-            print(f"[Startup] Warning: Could not get system information: {e}")
-        
-        # Auto-connect to OBS Virtual Camera on startup
-        # IMPORTANT: OBS Virtual Camera only exists when OBS Studio is running.
-        # OBS Studio uses the HDMI capture device (typically at index 0) as a source,
-        # and outputs to OBS Virtual Camera (typically at indices 1, 2, or 3).
-        # We want OBS Virtual Camera (the output), not the HDMI capture device (the input).
-        print("[Startup] Auto-detecting OBS Virtual Camera...")
-        
-        if platform.system() == "Windows":
-            # Check if OBS is running
-            obs_running = False
-            try:
-                result = subprocess.run(['tasklist', '/FI', 'IMAGENAME eq obs64.exe'], 
-                                      capture_output=True, timeout=1)
-                obs_running = result.returncode == 0 and b'obs64.exe' in result.stdout
-            except:
-                pass
-            
-            if not obs_running:
-                print("[Startup] ⚠ WARNING: OBS Studio is not running. OBS Virtual Camera will not be available.")
-                print("[Startup]    Please start OBS Studio and enable Virtual Camera.")
-                # Fallback to index 1, but it probably won't work
+            # Use obs.py method: On Windows, always try index 1 with DSHOW backend (obs.py default)
+            if platform.system() == "Windows":
+                # Check if OBS is running
+                obs_running = False
+                try:
+                    result = subprocess.run(['tasklist', '/FI', 'IMAGENAME eq obs64.exe'], 
+                                          capture_output=True, timeout=1)
+                    obs_running = result.returncode == 0 and b'obs64.exe' in result.stdout
+                except:
+                    pass
+                
+                # Always use obs.py method (index 1 with DSHOW) - matches obs.py exactly
+                # obs.py uses CAMERA_INDEX = 1 and DSHOW backend by default
+                if obs_running:
+                    print("[Startup] ✓ OBS detected - using obs.py method: index 1 with DSHOW")
+                else:
+                    print("[Startup] OBS not detected, but trying obs.py method: index 1 with DSHOW")
                 detected_idx = 1
                 detected_backend_name = "DSHOW"
-                print(f"[Startup] Will try index 1 as fallback (OBS Virtual Camera won't exist)")
             else:
-                # OBS is running - find OBS Virtual Camera
-                print("[Startup] OBS is running - searching for OBS Virtual Camera...")
-                obs_idx, found = find_obs_virtual_camera()
-                if found:
-                    detected_idx = obs_idx
-                    detected_backend_name = "DSHOW"
-                    print(f"[Startup] ✓ Found OBS Virtual Camera at index {detected_idx}")
-                    # CRITICAL: On Windows DSHOW, cameras don't release immediately
-                    # Add delay to allow camera to be fully released before run_loop tries to open it
-                    print("[Startup] Waiting for camera to release (Windows DSHOW)...")
-                    import gc
-                    # Force garbage collection multiple times to ensure camera handle is released
-                    gc.collect()
-                    time.sleep(1.0)
-                    gc.collect()
-                    time.sleep(1.0)
-                    gc.collect()
-                    time.sleep(3.0)  # Total 5 seconds for DSHOW to fully release
-                    print("[Startup] Camera should be released now, starting video thread...")
-                else:
-                    # Not found, but OBS is running - try index 1 as fallback
-                    print("[Startup] ⚠ OBS Virtual Camera not found, trying index 1 as fallback...")
-                    detected_idx = 1
-                    detected_backend_name = "DSHOW"
-        else:
-            # macOS: Check if OBS is running and find OBS Virtual Camera
-            obs_running = False
-            try:
-                result = subprocess.run(['pgrep', '-f', 'obs'], capture_output=True, timeout=2)
-                obs_running = result.returncode == 0 and len(result.stdout.strip()) > 0
-            except:
-                pass
-            
-            if obs_running:
-                print("[Startup] OBS is running on macOS - searching for OBS Virtual Camera...")
-                # On macOS, OBS Virtual Camera typically appears at index 1 or 2
-                # Scan indices 1-5 for 1920x1080 cameras
-                obs_found = False
-                for idx in [1, 2, 3, 4, 5]:
-                    try:
-                        cap = cv2.VideoCapture(idx, cv2.CAP_AVFOUNDATION)
-                        if cap and cap.isOpened():
-                            # Set buffer size to 1 for real-time updates
-                            try:
-                                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                            except:
-                                pass
-                            # Try to read a frame to check resolution
-                            ret, frame = cap.read()
-                            if ret and frame is not None:
-                                h, w = frame.shape[:2]
-                                print(f"[Startup]   Index {idx}: {w}x{h}")
-                                if w == 1920 and h == 1080:
-                                    print(f"[Startup] ✓ Found OBS Virtual Camera at index {idx} (1920x1080, AVFOUNDATION)")
-                                    detected_idx = idx
-                                    detected_backend_name = "AVFOUNDATION"
-                                    obs_found = True
-                                    cap.release()
-                                    break
-                            cap.release()
-                        else:
-                            print(f"[Startup]   Index {idx}: Could not open")
-                    except Exception as e:
-                        print(f"[Startup]   Error checking index {idx}: {e}")
-                        continue
-                
-                if not obs_found:
-                    print("[Startup] ⚠ OBS Virtual Camera not found (no 1920x1080 camera detected)")
-                    print("[Startup]    Make sure OBS Virtual Camera is started (Tools > Start Virtual Camera)")
-                    print("[Startup]    Trying index 1 as fallback...")
-                    detected_idx = 1
-                    detected_backend_name = "AVFOUNDATION"
-            else:
-                print("[Startup] ⚠ OBS Studio is not running. OBS Virtual Camera will not be available.")
-                print("[Startup]    Please start OBS Studio and enable Virtual Camera.")
-                # Fallback to index 1
+                # macOS: use index 1 (OBS/USB capture location)
                 detected_idx = 1
                 detected_backend_name = "AVFOUNDATION"
-                print(f"[Startup] Using index {detected_idx} with {detected_backend_name} backend (OBS not running)")
-        
-        with mon.lock:
-            mon.src = detected_idx
-            mon.backend_name = detected_backend_name
-            print(f"[Startup] Camera source set to: index {detected_idx}, backend {detected_backend_name}")
-        
-        # NOTE: DO NOT auto-start video thread here - let the browser trigger /start_video
-        # Starting here causes TWO threads to run (startup + /start_video), which causes
-        # camera locking conflicts on Windows DSHOW and crashes with access violations.
-        print(f"[Startup] Video thread will start when browser loads and calls /start_video")
+            
+            with mon.lock:
+                mon.src = detected_idx
+                mon.backend_name = detected_backend_name
+            
+            print(f"[Startup] Starting with Source={detected_idx}, Backend={detected_backend_name}")
+            
+            # Automatically start video feed
+            with mon.lock:
+                if not mon.video_running:
+                    mon.video_running = True
+                    mon.running = True
+                    mon.status = "video_starting"
+                    mon.last_frame = None
+                    mon.last_crop = None
+                    
+                    # Start video thread
+                    t = threading.Thread(target=run_loop, daemon=True)
+                    mon.worker = t
+                    t.start()
+                    print(f"[Startup] ✓ Video feed thread started")
+                else:
+                    print(f"[Startup] ⚠ Video feed already running")
+        except Exception as e:
+            print(f"[Startup] ⚠ Auto-connect failed: {e}")
+            import traceback
+            traceback.print_exc()
+            # Try to start anyway with defaults
+            with mon.lock:
+                if not mon.video_running:
+                    try:
+                        mon.video_running = True
+                        mon.running = True
+                        mon.status = "video_starting"
+                        mon.last_frame = None
+                        mon.last_crop = None
+                        t = threading.Thread(target=run_loop, daemon=True)
+                        mon.worker = t
+                        t.start()
+                        print("[Startup] Default video feed thread started")
+                    except Exception as e2:
+                        print(f"[Startup] Failed to start default video feed: {e2}")
     
-        # Pick a port (try 5055 first, otherwise the next available up to 5070)
-        PORT = _choose_port(5055, 5070)
-        print(f"Starting server on http://localhost:{PORT} …")
-        # Launch the browser shortly after the server starts
-        threading.Timer(0.6, open_browser).start()
-        app.run(host="127.0.0.1", port=PORT, debug=False)
-        
-    except KeyboardInterrupt:
-        print("\n[Shutdown] Received keyboard interrupt (Ctrl+C)")
-        print("[Shutdown] Stopping application gracefully...")
-        sys.exit(0)
-    except Exception as startup_err:
-        print("\n" + "=" * 80)
-        print("FATAL ERROR: Application crashed during startup")
-        print("=" * 80)
-        print(f"Error: {startup_err}")
-        print("\nFull traceback:")
-        import traceback
-        traceback.print_exc()
-        print("\n" + "=" * 80)
-        print("TROUBLESHOOTING:")
-        print("1. Check that all dependencies are installed: pip install -r requirements.txt")
-        print("2. Verify that openpyxl is installed: pip install openpyxl")
-        print("3. Check that camera permissions are granted (System Settings > Privacy)")
-        print("4. On Windows: Ensure OBS Studio is running and Virtual Camera is started")
-        print("5. On macOS: Ensure OBS Studio is running and Virtual Camera is started")
-        print("6. Review error messages above for specific missing dependencies or permissions")
-        print("=" * 80)
-        sys.exit(1)
+    # Start auto-connection in background thread so server can start immediately
+    # This prevents the server from hanging if camera detection is slow
+    auto_connect_thread = threading.Thread(target=auto_connect_camera, daemon=True)
+    auto_connect_thread.start()
+    
+    # Pick a port (try 5055 first, otherwise the next available up to 5070)
+    PORT = _choose_port(5055, 5070)
+    print(f"Starting server on http://localhost:{PORT} …")
+    # Launch the browser shortly after the server starts
+    threading.Timer(0.6, open_browser).start()
+    app.run(host="127.0.0.1", port=PORT, debug=False)

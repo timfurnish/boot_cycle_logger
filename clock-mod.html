@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>OBS Timestamp Overlay</title>
+</head>
+<body translate="no" style="margin:0; padding:0; background:transparent;">
+  <div id="output"
+       style="display:inline-block;
+              font-family:monospace;
+              font-size:30px;
+              text-align:right;
+              color:lightgray;
+              border-radius:10px;
+              padding:10px;
+              background-color:rgba(0,0,0,0.75);">
+  </div>
+
+  <script>
+    // Read URL query parameters
+    const params = new URLSearchParams(window.location.search);
+    const output = document.getElementById("output");
+
+    const format = params.get("format") || "YYYY/MM/DD HH:mm:ss:SSS";
+    const customStyle = params.get("style");
+    const bodyStyle = params.get("bodyStyle");
+
+    if (customStyle) output.setAttribute("style", customStyle);
+    if (bodyStyle) document.body.setAttribute("style", bodyStyle);
+
+    function pad(num, size) {
+      let s = String(num);
+      while (s.length < size) s = "0" + s;
+      return s;
+    }
+
+    // Simple formatter supporting: YYYY MM DD HH mm ss SSS
+    function formatTime(date, fmt) {
+      const replacements = {
+        "YYYY": date.getFullYear().toString(),
+        "MM": pad(date.getMonth() + 1, 2),
+        "DD": pad(date.getDate(), 2),
+        "HH": pad(date.getHours(), 2),
+        "mm": pad(date.getMinutes(), 2),
+        "ss": pad(date.getSeconds(), 2),
+        "SSS": pad(date.getMilliseconds(), 3)
+      };
+
+      return fmt.replace(/YYYY|SSS|MM|DD|HH|mm|ss/g, match => replacements[match]);
+    }
+
+    function tick() {
+      const now = new Date();
+      output.textContent = formatTime(now, format);
+      requestAnimationFrame(tick);
+    }
+
+    tick();
+  </script>
+</body>
+</html>

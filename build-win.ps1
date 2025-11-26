@@ -32,6 +32,7 @@ Write-Host "[4/6] Installing PyInstaller..."
 # Clean previous artifacts
 Write-Host "[5/6] Cleaning old build artifacts..."
 Remove-Item -Recurse -Force build, dist, __pycache__ -ErrorAction SilentlyContinue
+Remove-Item -Force "*.spec" -ErrorAction SilentlyContinue
 
 # Optional icon
 $IconFlag = @()
@@ -41,18 +42,31 @@ if (Test-Path ".\icon.ico") {
 
 # Data files to bundle (Windows uses semicolon `;` in --add-data)
 $AddData = @(
-    "--add-data", "Scope-Disconnected.png;.",
-    "--add-data", "Scope-Connected-SidewinderCCU.png;.",
-    "--add-data", "Scope-Connected-OtherCCU.png;."
+    "--add-data", "art;art",
+    "--add-data", "templates;templates"
 )
 
-# Build
+# Verify main script exists and has our new features
+$MainScript = "boot_cycle_gui_web-macpc-6ch.py"
+if (-not (Test-Path $MainScript)) {
+    Write-Host "❌ ERROR: Main script '$MainScript' not found!"
+    exit 1
+}
+
+# Check if the script has our new camera features
+$ScriptContent = Get-Content $MainScript -Raw
+if (-not ($ScriptContent -match "connectCamera|autoDetectCamera|listAvailableCameras")) {
+    Write-Host "⚠️  WARNING: Script may not have latest camera features!"
+    Write-Host "   Looking for: connectCamera, autoDetectCamera, listAvailableCameras"
+}
+
 Write-Host "[6/6] Building BootCycleLogger.exe with PyInstaller..."
+Write-Host "   Using script: $MainScript"
 & $PyExe -m PyInstaller --noconfirm --clean --onefile --noconsole `
     --name BootCycleLogger `
     @IconFlag `
     @AddData `
-    "boot_cycle_gui_web-macpc.py"
+    $MainScript
 
 # Summarize
 if (Test-Path ".\dist\BootCycleLogger.exe") {
