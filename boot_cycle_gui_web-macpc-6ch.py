@@ -3031,7 +3031,12 @@ def index():
       timerEndTime = null;
       timerTimeEl.textContent = '00:00:00';
       console.log('Timer expired - auto-stopping test...');
-      endTest();
+      console.log('Calling endTest() to trigger post-processing...');
+      // Call endTest() and handle any errors
+      endTest().catch(err => {
+        console.error('Error in endTest() when timer expired:', err);
+        alert('Error ending test when timer expired: ' + (err.message || err));
+      });
       return;
     }
     
